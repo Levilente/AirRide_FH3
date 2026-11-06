@@ -60,7 +60,7 @@ char* g_game           = nullptr;
 // fh3-mods\Airride.ini (written with these defaults on first start).
 int g_hold_ms         = 1000;   // how long the left stick is held to lower / raise
 int g_default_drop    = 5;      // cm, for a car whose slider was never touched
-float g_camber_per_cm = 0.4f;   // degrees of negative camber per cm of drop
+float g_camber_per_cm = 0.55f;   // degrees of negative camber per cm of drop
 float g_duration      = 1.4f;   // seconds a lowering or raising takes
 int g_step_ms         = 33;     // the spec is re-applied at most this often while moving
 float g_still_mps     = 0.5f;   // the car counts as standing still below this speed
