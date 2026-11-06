@@ -596,6 +596,7 @@ int resolve_anchors(char* car) {
 }
 
 char* g_vis_car = nullptr;
+bool g_body_hook_on = false;
 bool g_vis_pending = false;
 int g_vis_target = 0;
 float g_vis_p = 0, g_vis_drop_m = 0;
@@ -614,6 +615,7 @@ float g_vis_camber_deg = 0;
 
 CRITICAL_SECTION g_vis_cs;
 std::atomic<int> g_cache_calls{0};
+std::atomic<int> g_body_hits{0};
 std::atomic<float> g_vis_e{0};
 std::atomic<int> g_vis_thread_on{0};
 
@@ -700,7 +702,8 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
         } else if (speed > g_still_mps) {
             say("airride: stick held, but the car isn't standing still (%.2f m/s)", static_cast<double>(speed));
         } else if (!g_vis_pending) {
-            const int n = resolve_anchors(car);
+            int n = 0;
+            if (g_body_hook_on) { g_parts[0] = Part{}; n = 1; } else n = resolve_anchors(car);
             if (g_probe) probe_start(car);
             if (n > 0) {
                 g_nparts.store(n);
@@ -741,7 +744,7 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
         static int last_state = -1;
         if (last_state != g_vis_target) {
-            say("airride(visual): %s (the game rewrote the body matrix %d times; the cache hook ran %d times)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_cache_calls.load());
+            say("airride(visual): %s (the game rewrote the body matrix %d times; the cache hook ran %d times, the body setter was changed %d times)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_cache_calls.load(), g_body_hits.load());
             last_state = g_vis_target;
         }
         if (!g_vis_target) { last_state = -1; vis_forget(); }
@@ -854,6 +857,38 @@ uint64_t detour_cache(void* self) {
     return r;
 }
 
+
+// game+0x21FF980 is the FH3 twin of the FH2 body setter the StanceAirride mod intercepts: it copies the body's 4x4 matrix into the
+// scene's body node (this+0x10) and tail-jumps on. Three callers, like in FH2. The matrix is a scratch copy on the caller's stack, so
+// it can be changed before the original runs. Only a matrix within 2 m of the player's car (the dynamics' world position) is touched.
+typedef uint64_t (*BodySetFn)(void*, float*);
+BodySetFn g_orig_body = nullptr;
+uint64_t detour_body(void* target, float* m) {
+    if (g_vis_active && m && g_vis_car) {
+        __try {
+            const float e = g_vis_e.load();
+            char* iface   = *reinterpret_cast<char**>(g_vis_car + kOffIface);
+            if (iface && e > 0.0f && readable(m, 64)) {
+                const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
+                const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
+                if (dx * dx + dy * dy + dz * dz < 4.0f) {
+                    static int logged = 0;
+                    if (logged < 12) {
+                        ++logged;
+                        say("airride(visual): body setter near the car: target %p from game+0x%llX, rel (%.2f, %.2f, %.2f)", target,
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game)),
+                            static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
+                    }
+                    m[13] -= g_vis_drop_m * e;
+                    g_body_hits.fetch_add(1);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    return g_orig_body(target, m);
+}
+
 typedef uint64_t (*CarUpdateFn)(void*, float);
 CarUpdateFn g_orig_car_update = nullptr;
 uint64_t detour_car_update(void* self, float dt) {
@@ -895,6 +930,11 @@ DWORD WINAPI install_hooks(LPVOID) {
                                        reinterpret_cast<void**>(&g_orig_cache));
     if (h3) g_api->enable_hooks(g_mod, h3);
     say("hooks: body matrix cache %s", h3 ? "on" : "FAILED");
+    FH3Hook* h4 = g_api->hook_function(g_mod, "body setter (Airride)", g_game + 0x21FF980, reinterpret_cast<void*>(&detour_body),
+                                       reinterpret_cast<void**>(&g_orig_body));
+    if (h4) g_api->enable_hooks(g_mod, h4);
+    g_body_hook_on = h4 != nullptr;
+    say("hooks: body setter %s", h4 ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
     const bool b = h2 && g_api->enable_hooks(g_mod, h2);
     say("hooks: Car update %s, HUD controller %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
