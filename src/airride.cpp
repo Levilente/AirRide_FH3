@@ -939,14 +939,14 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
                 if (g_camber_on) {
                     static int plog = 0;
                     if (plog < 16 && kind == 0) { ++plog; say("airride(visual): wheel %u local pos (%.3f, %.3f, %.3f) rows x(%.2f %.2f %.2f) y(%.2f %.2f %.2f)", wheel, double(m[12]), double(m[13]), double(m[14]), double(m[0]), double(m[1]), double(m[2]), double(m[4]), double(m[5]), double(m[6])); }
-                    const float side = m[12] > 0 ? 1.0f : -1.0f;
+                    const float side = m[14] > 0 ? 1.0f : -1.0f;   // the car's frame: x is along the car (front/rear), z across it (the log's wheel positions: x +-1.4, z +-0.9)
                     const float th   = side * g_camber_sign * g_vis_camber_deg * e * 0.01745329252f;   // top of the wheel toward the car
                     const float cs = std::cos(th), sn = std::sin(th);
-                    for (int r = 0; r < 3; ++r) {   // rotate each basis row about the car's z axis (through the hub)
+                    for (int r = 0; r < 3; ++r) {   // rotate each basis row about the car's long (x) axis through the hub: the camber
                         float* v = m + r * 4;
-                        const float vx = v[0], vy = v[1];
-                        v[0] = vx * cs - vy * sn;
-                        v[1] = vx * sn + vy * cs;
+                        const float vy = v[1], vz = v[2];
+                        v[1] = vy * cs + vz * sn;
+                        v[2] = -vy * sn + vz * cs;
                     }
                 }
                 g_wheel_hits.fetch_add(1);
