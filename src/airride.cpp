@@ -616,6 +616,8 @@ float g_vis_camber_deg = 0;
 CRITICAL_SECTION g_vis_cs;
 std::atomic<int> g_cache_calls{0};
 std::atomic<int> g_body_hits{0};
+float g_body_rot[12], g_body_pos[3];
+std::atomic<int> g_wheel_hits{0};
 std::atomic<float> g_vis_e{0};
 std::atomic<int> g_vis_thread_on{0};
 
@@ -744,7 +746,7 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
         static int last_state = -1;
         if (last_state != g_vis_target) {
-            say("airride(visual): %s (the game rewrote the body matrix %d times; the cache hook ran %d times, the body setter was changed %d times)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_cache_calls.load(), g_body_hits.load());
+            say("airride(visual): %s (the game rewrote the body matrix %d times; the cache hook ran %d times, the body setter was changed %d times, the wheel setters %d times)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_cache_calls.load(), g_body_hits.load(), g_wheel_hits.load());
             last_state = g_vis_target;
         }
         if (!g_vis_target) { last_state = -1; vis_forget(); }
@@ -864,8 +866,6 @@ uint64_t detour_cache(void* self) {
 typedef uint64_t (*BodySetFn)(void*, float*);
 BodySetFn g_orig_body = nullptr;
 uint64_t detour_body(void* target, float* m) {
-    float restore_y = 0;
-    float* restore_m = nullptr;
     if (g_vis_active && m && g_vis_car) {
         __try {
             const float e = g_vis_e.load();
@@ -881,19 +881,75 @@ uint64_t detour_body(void* target, float* m) {
                             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game)),
                             static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
                     }
-                    restore_m = m;
-                    restore_y = g_vis_drop_m * e;
-                    m[13] -= restore_y;   // the scene's body node takes this; the caller's own copy is put back below (the wheels are built from it)
+                    for (int k = 0; k < 12; ++k) g_body_rot[k] = m[k];   // lateral, up, forward rows of the body (before the offset)
+                    g_body_pos[0] = m[12]; g_body_pos[1] = m[13]; g_body_pos[2] = m[14];
+                    m[13] -= g_vis_drop_m * e;   // everything built from this matrix (body, driver, steering wheel, and the wheels) goes down; the wheels are lifted back in their own setters
                     g_body_hits.fetch_add(1);
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
-    const uint64_t r = g_orig_body(target, m);
-    if (restore_m) restore_m[13] += restore_y;
+    return g_orig_body(target, m);
+}
+
+
+// The wheels' setters (twins of the FH2 tire / wheel hooks): the matrix is a stack scratch passed to both in turn. The wheels were built
+// from the lowered body matrix, so they are lifted back by the drop, and leaned for the negative camber. The scratch is put back after
+// each call because the second setter gets the same buffer.
+typedef uint64_t (*PartSetFn)(void*, unsigned, float*, void*, void*);
+PartSetFn g_orig_tire = nullptr, g_orig_wheel = nullptr;
+
+uint64_t part_detour(PartSetFn orig, void* scene, unsigned wheel, float* m, void* ctx, void* aux) {
+    float saved[16];
+    bool changed = false;
+    if (g_vis_active && g_vis_car && m && wheel < 4) {
+        __try {
+            const float e = g_vis_e.load();
+            char* iface   = *reinterpret_cast<char**>(g_vis_car + kOffIface);
+            if (iface && e > 0.0f && readable(m, 64)) {
+                const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
+                const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
+                if (dx * dx + dy * dy + dz * dz < 9.0f) {
+                    std::memcpy(saved, m, 64);
+                    changed = true;
+                    // which side is this wheel on? lateral axis = the body's first row (seen at the body setter)
+                    const float* lat = g_body_rot;
+                    const float* up  = g_body_rot + 4;
+                    const float* fwd = g_body_rot + 8;
+                    const float dl   = dx * lat[0] + dy * lat[1] + dz * lat[2];
+                    const float side = dl > 0 ? 1.0f : -1.0f;
+                    m[13] += g_vis_drop_m * e;   // back to where the wheel was
+                    if (g_camber_on) {
+                        // the wheel's top must move toward the car: rotate the basis rows about the car's long axis through the hub
+                        const float cx = fwd[1] * up[2] - fwd[2] * up[1], cy = fwd[2] * up[0] - fwd[0] * up[2], cz = fwd[0] * up[1] - fwd[1] * up[0];   // fwd x up
+                        const float toward = -side * (cx * lat[0] + cy * lat[1] + cz * lat[2]);   // > 0 if +theta moves the top inward
+                        const float th = (toward >= 0 ? 1.0f : -1.0f) * g_camber_sign * g_vis_camber_deg * e * 0.01745329252f;
+                        const float cs = std::cos(th), sn = std::sin(th);
+                        const float ax = fwd[0], ay = fwd[1], az = fwd[2];
+                        for (int r = 0; r < 3; ++r) {
+                            float* v = m + r * 4;
+                            const float vx = v[0], vy = v[1], vz = v[2];
+                            const float kx = ay * vz - az * vy, ky = az * vx - ax * vz, kz = ax * vy - ay * vx;   // a x v
+                            const float d  = (ax * vx + ay * vy + az * vz) * (1.0f - cs);
+                            v[0] = vx * cs + kx * sn + ax * d;
+                            v[1] = vy * cs + ky * sn + ay * d;
+                            v[2] = vz * cs + kz * sn + az * d;
+                        }
+                    }
+                    g_wheel_hits.fetch_add(1);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            changed = false;
+        }
+    }
+    const uint64_t r = orig(scene, wheel, m, ctx, aux);
+    if (changed) std::memcpy(m, saved, 64);
     return r;
 }
+uint64_t detour_tire(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(g_orig_tire, scene, wheel, m, ctx, aux); }
+uint64_t detour_wheel(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(g_orig_wheel, scene, wheel, m, ctx, aux); }
 
 typedef uint64_t (*CarUpdateFn)(void*, float);
 CarUpdateFn g_orig_car_update = nullptr;
@@ -941,6 +997,11 @@ DWORD WINAPI install_hooks(LPVOID) {
     if (h4) g_api->enable_hooks(g_mod, h4);
     g_body_hook_on = h4 != nullptr;
     say("hooks: body setter %s", h4 ? "on" : "FAILED");
+    FH3Hook* h5 = g_api->hook_call(g_mod, "tire matrix (Airride)", g_game + 0x1E717BA, reinterpret_cast<void*>(&detour_tire), reinterpret_cast<void**>(&g_orig_tire));
+    FH3Hook* h6 = g_api->hook_call(g_mod, "wheel matrix (Airride)", g_game + 0x1E717D7, reinterpret_cast<void*>(&detour_wheel), reinterpret_cast<void**>(&g_orig_wheel));
+    if (h5) g_api->enable_hooks(g_mod, h5);
+    if (h6) g_api->enable_hooks(g_mod, h6);
+    say("hooks: tire setter %s, wheel setter %s", h5 ? "on" : "FAILED", h6 ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
     const bool b = h2 && g_api->enable_hooks(g_mod, h2);
     say("hooks: Car update %s, HUD controller %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
