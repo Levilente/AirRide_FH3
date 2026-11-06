@@ -618,6 +618,11 @@ std::atomic<int> g_cache_calls{0};
 std::atomic<int> g_body_hits{0};
 std::atomic<int> g_wc[2][8][2];   // [tire/wheel setter][wheel index][corrected?] while lowered
 float g_body_rot[12], g_body_pos[3];
+void* g_player_scenes[8] = {};
+std::atomic<int> g_player_scene_n{0};
+bool known_scene(void* sc) { const int n = g_player_scene_n.load(); for (int i = 0; i < n && i < 8; ++i) if (g_player_scenes[i] == sc) return true; return false; }
+void add_scene(void* sc) { if (known_scene(sc)) return; const int n = g_player_scene_n.load(); if (n < 8) { g_player_scenes[n] = sc; g_player_scene_n.store(n + 1); } }
+
 std::atomic<int> g_wheel_hits{0};
 std::atomic<float> g_vis_e{0};
 std::atomic<int> g_vis_thread_on{0};
@@ -673,6 +678,7 @@ void vis_write_locked(float e) {
 }
 
 void vis_forget() {
+    g_player_scene_n.store(0);
     g_vis_thread_on.store(0);
     g_vis_e.store(0);
     g_vis_pending = false;
@@ -875,7 +881,7 @@ uint64_t detour_cache(void* self) {
 // it can be changed before the original runs. Only a matrix within 2 m of the player's car (the dynamics' world position) is touched.
 typedef uint64_t (*BodySetFn)(void*, float*);
 BodySetFn g_orig_body = nullptr;
-std::atomic<int> g_wheel_ctx_player{0};   // the car whose body was just set from game+0x1E32C05 is the player's (its wheels follow in the same function)
+thread_local int t_wheel_ctx_player = 0;   // per thread (the game renders cars on several threads at once); the car whose body was just set from game+0x1E32C05 is the player's (its wheels follow in the same function)
 uint64_t detour_body(void* target, float* m) {
     if (g_vis_car && m) {
         __try {
@@ -885,7 +891,7 @@ uint64_t detour_body(void* target, float* m) {
                 const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
                 const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
                 const bool near_player = dx * dx + dy * dy + dz * dz < 4.0f;
-                if (ret == 0x1E32C05) g_wheel_ctx_player.store(near_player ? 1 : 0);
+                if (ret == 0x1E32C05) t_wheel_ctx_player = near_player ? 1 : 0;
                 const float e = g_vis_e.load();
                 if (g_vis_active && near_player && e > 0.0f) {
                     static int logged = 0;
@@ -911,13 +917,12 @@ uint64_t detour_body(void* target, float* m) {
 typedef uint64_t (*PartSetFn)(void*, unsigned, float*, void*, void*);
 PartSetFn g_orig_tire = nullptr, g_orig_wheel = nullptr;
 
-std::atomic<void*> g_player_scene{nullptr};
 uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, float* m, void* ctx, void* aux) {
     float saved[16];
     bool changed = false;
-    const bool flag = g_wheel_ctx_player.load() != 0;
-    if (flag && g_vis_active) g_player_scene.store(scene);
-    const bool mine = g_vis_active && (flag || scene == g_player_scene.load());
+    const bool flag = t_wheel_ctx_player != 0;
+    if (flag && g_vis_active) add_scene(scene);
+    const bool mine = g_vis_active && (flag || known_scene(scene));
     if (g_vis_active && g_vis_e.load() > 0.0f && wheel < 8) g_wc[kind][wheel][mine ? 1 : 0].fetch_add(1);
     if (mine && m && wheel < 8) {
         __try {
