@@ -966,7 +966,8 @@ uint64_t detour_body(void* target, float* m) {
                     if (e > 0.0f) {
                         ctx = true;
                         pv_ctx = true;
-                        drop = g_preview_cm * 0.01f * e;   // no camber in the preview: the showroom car's wheel frame isn't the driven car's
+                        drop = g_preview_cm * 0.01f * e;
+                        camber = g_camber_per_cm * g_preview_cm * e;
                     }
                 }
                 if (ret == 0x1E32C05) {   // the wheels of this car follow in the same function, on this thread
@@ -998,7 +999,7 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
     if (flag && g_vis_active && t_ctx_drop > 0.0f && g_vis_e.load() > 0.0f) add_scene(scene);
     const bool scene_mine = g_vis_active && !flag && known_scene(scene);
     const float pv = g_pv_e.load();
-    const bool pv_all = pv > 0.0f && !(flag && !t_ctx_preview) && !scene_mine;   // the garage preview: every wheel part drawn is lifted back by the drop (all bodies were lowered)
+    const bool pv_all = pv > 0.0f && !flag && !scene_mine;   // the garage preview: every wheel part drawn is lifted back by the drop (all bodies were lowered)
     const bool mine = flag || scene_mine || pv_all;
     if (g_vis_active && g_vis_e.load() > 0.0f && wheel < 8) g_wc[kind][wheel][mine ? 1 : 0].fetch_add(1);
     if (mine && m && wheel < 8) {
@@ -1013,21 +1014,32 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
                 changed = true;
                 // The matrix is the wheel's, in the car's own frame (x lateral, y up, z forward): it moves with the body matrix, which was
                 // lowered by `drop` along the world's up. Undo that in the car's frame: drop times the world-up's components in it.
-                const float lift = drop_now;
-                m[12] += lift * rot[1];
-                m[13] += lift * rot[5];
-                m[14] += lift * rot[9];
+                // The wheel matrices are the wheel's place relative to the body, but in the world's orientation: the car turns, they turn with it. The body
+                // matrix's rows (rot) are the car's own axes in the world: lateral (x), up (y), forward (z). The body went down along the world's up, so
+                // the wheel goes up by the same along the world's up.
+                const float* bx = rot;
+                const float* by = rot + 4;
+                const float* bz = rot + 8;
+                const float lat = m[12] * bx[0] + m[13] * bx[1] + m[14] * bx[2];   // which side of the car the wheel is on
+                m[13] += drop_now;
                 if (g_camber_on && camber_now != 0.0f) {
-                    static int plog = 0;
-                    if (plog < 16 && kind == 0) { ++plog; say("airride(visual): wheel %u local pos (%.3f, %.3f, %.3f) rows x(%.2f %.2f %.2f) y(%.2f %.2f %.2f)", wheel, double(m[12]), double(m[13]), double(m[14]), double(m[0]), double(m[1]), double(m[2]), double(m[4]), double(m[5]), double(m[6])); }
-                    const float side = m[14] > 0 ? 1.0f : -1.0f;   // the car's frame: x is along the car (front/rear), z across it (the log's wheel positions: x +-1.4, z +-0.9)
-                    const float th   = side * g_camber_sign * camber_now * e * 0.01745329252f;   // top of the wheel toward the car
+                    const float side = lat > 0 ? 1.0f : -1.0f;
+                    // bz x by dotted with bx tells how the rows are handed: the lean that puts the wheel's top toward the car depends on it
+                    const float cx = bz[1] * by[2] - bz[2] * by[1], cy = bz[2] * by[0] - bz[0] * by[2], cz = bz[0] * by[1] - bz[1] * by[0];
+                    const float hand = (cx * bx[0] + cy * bx[1] + cz * bx[2]) >= 0 ? 1.0f : -1.0f;
+                    const float th = -side * hand * g_camber_sign * camber_now * 0.01745329252f;
                     const float cs = std::cos(th), sn = std::sin(th);
-                    for (int r = 0; r < 3; ++r) {   // rotate each basis row about the car's long (x) axis through the hub: the camber
-                        float* v = m + r * 4;
-                        const float vy = v[1], vz = v[2];
-                        v[1] = vy * cs + vz * sn;
-                        v[2] = -vy * sn + vz * cs;
+                    const float len = std::sqrt(bz[0] * bz[0] + bz[1] * bz[1] + bz[2] * bz[2]);
+                    if (len > 0.5f) {
+                        const float ax = bz[0] / len, ay = bz[1] / len, az = bz[2] / len;   // the car's forward axis: the camber turns the wheel about it
+                        for (int r = 0; r < 3; ++r) {   // Rodrigues' rotation of each basis row about it, through the hub
+                            float* v = m + r * 4;
+                            const float d = ax * v[0] + ay * v[1] + az * v[2];
+                            const float qx = ay * v[2] - az * v[1], qy = az * v[0] - ax * v[2], qz = ax * v[1] - ay * v[0];
+                            v[0] = v[0] * cs + qx * sn + ax * d * (1.0f - cs);
+                            v[1] = v[1] * cs + qy * sn + ay * d * (1.0f - cs);
+                            v[2] = v[2] * cs + qz * sn + az * d * (1.0f - cs);
+                        }
                     }
                 }
                 g_wheel_hits.fetch_add(1);
