@@ -907,7 +907,7 @@ uint64_t part_detour(PartSetFn orig, void* scene, unsigned wheel, float* m, void
     if (g_vis_active && g_wheel_ctx_player.load() && m && wheel < 8) {
         __try {
             const float e = g_vis_e.load();
-            if (e > 0.0f && readable(m, 64) && looks_matrix(m)) {
+            if (e > 0.0f && readable(m, 64) && std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]) && std::fabs(m[12]) < 20.0f && std::fabs(m[13]) < 20.0f && std::fabs(m[14]) < 20.0f) {
                 std::memcpy(saved, m, 64);
                 changed = true;
                 // The matrix is the wheel's, in the car's own frame (x lateral, y up, z forward): it moves with the body matrix, which was
