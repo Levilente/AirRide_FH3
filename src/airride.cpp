@@ -1134,11 +1134,11 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
         row.key     = "Drop";
         row.label   = "Airride|Drop (cm)";
         static char help[200];
-        snprintf(help, sizeof help, "How far the Airride lowers the car, in centimetres (1 to 10, in half-centimetre steps). Each centimetre also adds %.2f degrees of negative camber so the wheels fit.", static_cast<double>(g_camber_per_cm));
+        snprintf(help, sizeof help, "How far the Airride lowers the car, in centimetres (1 to 10, in steps of 0.1). Each centimetre also adds %.2f degrees of negative camber so the wheels fit.", static_cast<double>(g_camber_per_cm));
         row.help    = help;
         row.min     = 1;
         row.max     = 10;
-        row.step    = 0.5f;
+        row.step    = 0.1f;
         row.decimals = 1;
         row.get     = row_get;
         row.set     = row_set;
