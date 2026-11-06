@@ -232,40 +232,61 @@ void probe_object(const char* tag, const char* obj, size_t span) {
 }
 
 void probe_scan(char* car) {
-    struct Item { const char* p; int depth; const char* via; };
-    static Item queue[30000];
+    constexpr size_t kMax = 6000;
+    struct Item { const char* p; int depth; };
+    static Item queue[kMax];
+    static const char* seen[1 << 14];
+    std::memset(seen, 0, sizeof seen);
     size_t head = 0, tail = 0, found = 0;
-    queue[tail++] = {car, 0, "car"};
-    say("probe: scanning from the Car %p (game base %p)", static_cast<void*>(car), static_cast<void*>(g_game));
-    while (head < tail && found < 12) {
+    const ULONGLONG t0 = GetTickCount64();
+    auto mark = [&](const char* q) {   // true if new
+        size_t h = (reinterpret_cast<uintptr_t>(q) >> 3) * 0x9E3779B1u & ((1 << 14) - 1);
+        while (seen[h]) { if (seen[h] == q) return false; h = (h + 1) & ((1 << 14) - 1); }
+        seen[h] = q;
+        return true;
+    };
+    queue[tail++] = {car, 0};
+    mark(car);
+    say("probe: scanning from the Car %p", static_cast<void*>(car));
+    while (head < tail && found < 12 && GetTickCount64() - t0 < 4000) {
         const Item it = queue[head++];
         __try {
             if (!readable(it.p, 0x40)) continue;
             const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(it.p) - reinterpret_cast<uintptr_t>(g_game);
             if (vt == kVtCarRender1 || vt == kVtCarRender2 || vt == kVtDriver) {
                 const char* tag = vt == kVtDriver ? "DriverModel" : "CarRenderModel";
-                say("probe: found %s at %p, reached by %s (depth %d)", tag, static_cast<const void*>(it.p), it.via, it.depth);
+                say("probe: found %s at %p (depth %d)", tag, static_cast<const void*>(it.p), it.depth);
                 probe_object(tag, it.p, 0x500);
                 ++found;
                 continue;
             }
-            if (it.depth >= 5) continue;
-            for (size_t off = 8; off < 0x800 && tail < 30000; off += 8) {
-                if (!readable(it.p + off, 8)) break;
+            if (it.depth >= 4) continue;
+            // one readable() check per object, then plain reads inside __try
+            const size_t span = readable(it.p, 0x400) ? 0x400 : 0x40;
+            for (size_t off = 8; off < span && tail < kMax; off += 8) {
                 const char* q = *reinterpret_cast<const char* const*>(it.p + off);
-                if (reinterpret_cast<uintptr_t>(q) < 0x10000 || reinterpret_cast<uintptr_t>(q) > 0x00007FFFFFFFFFFFull || (reinterpret_cast<uintptr_t>(q) & 7)) continue;
-                bool seen = false;
-                for (size_t k = 0; k < tail && k < 4000; ++k) if (queue[k].p == q) { seen = true; break; }
-                if (!seen) {
-                    static char via[30000][24];
-                    snprintf(via[tail], 24, "%s+0x%zX", it.depth ? "..." : "car", off);
-                    queue[tail++] = {q, it.depth + 1, via[tail - 1]};
-                }
+                const uintptr_t v = reinterpret_cast<uintptr_t>(q);
+                if (v < 0x10000 || v > 0x00007FFFFFFFFFFFull || (v & 7)) continue;
+                if (mark(q)) queue[tail++] = {q, it.depth + 1};
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
-    say("probe: done, %zu objects visited, %zu render objects found", tail, found);
+    say("probe: done, %zu objects visited in %llu ms, %zu render objects found", head, static_cast<unsigned long long>(GetTickCount64() - t0), found);
+}
+
+std::atomic<char*> g_probe_car{nullptr};
+DWORD WINAPI probe_thread(LPVOID) {
+    char* car = g_probe_car.load();
+    if (car) probe_scan(car);
+    g_probe_car.store(nullptr);
+    return 0;
+}
+void probe_start(char* car) {
+    char* expected = nullptr;
+    if (!g_probe_car.compare_exchange_strong(expected, car)) return;
+    if (HANDLE t = CreateThread(nullptr, 0, probe_thread, nullptr, 0, nullptr)) CloseHandle(t);
+    else g_probe_car.store(nullptr);
 }
 
 float ease(float x) {   // smoothstep: ease in, ease out
@@ -397,7 +418,7 @@ void step(char* car, float dt) {
     const bool driving = GetTickCount64() - g_hud_tick.load() < 600;
 
     const int req = g_request.exchange(0);
-    if (req && g_probe) { probe_scan(car); }
+    if (req && g_probe) probe_start(car);
     if (req) {
         if (g_target == 1 || g_p > 0) {
             g_target = 0;
