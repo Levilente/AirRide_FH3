@@ -865,24 +865,26 @@ uint64_t detour_cache(void* self) {
 // it can be changed before the original runs. Only a matrix within 2 m of the player's car (the dynamics' world position) is touched.
 typedef uint64_t (*BodySetFn)(void*, float*);
 BodySetFn g_orig_body = nullptr;
+std::atomic<int> g_wheel_ctx_player{0};   // the car whose body was just set from game+0x1E32C05 is the player's (its wheels follow in the same function)
 uint64_t detour_body(void* target, float* m) {
-    if (g_vis_active && m && g_vis_car) {
+    if (g_vis_car && m) {
         __try {
-            const float e = g_vis_e.load();
-            char* iface   = *reinterpret_cast<char**>(g_vis_car + kOffIface);
-            if (iface && e > 0.0f && readable(m, 64)) {
+            const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game);
+            char* iface         = *reinterpret_cast<char**>(g_vis_car + kOffIface);
+            if (iface && readable(m, 64)) {
                 const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
                 const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
-                if (dx * dx + dy * dy + dz * dz < 4.0f) {
+                const bool near_player = dx * dx + dy * dy + dz * dz < 4.0f;
+                if (ret == 0x1E32C05) g_wheel_ctx_player.store(near_player ? 1 : 0);
+                const float e = g_vis_e.load();
+                if (g_vis_active && near_player && e > 0.0f) {
                     static int logged = 0;
-                    if (logged < 12) {
+                    if (logged < 6) {
                         ++logged;
-                        say("airride(visual): body setter near the car: target %p from game+0x%llX, rel (%.2f, %.2f, %.2f)", target,
-                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game)),
+                        say("airride(visual): body setter near the car: target %p from game+0x%llX, rel (%.2f, %.2f, %.2f)", target, static_cast<unsigned long long>(ret),
                             static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
                     }
-                    for (int k = 0; k < 12; ++k) g_body_rot[k] = m[k];   // lateral, up, forward rows of the body (before the offset)
-                    g_body_pos[0] = m[12]; g_body_pos[1] = m[13]; g_body_pos[2] = m[14];
+                    if (ret == 0x1E32C05) for (int k = 0; k < 12; ++k) g_body_rot[k] = m[k];   // lateral, up, forward rows of the body (before the offset)
                     m[13] -= g_vis_drop_m * e;   // everything built from this matrix (body, driver, steering wheel, and the wheels) goes down; the wheels are lifted back in their own setters
                     g_body_hits.fetch_add(1);
                 }
@@ -893,7 +895,6 @@ uint64_t detour_body(void* target, float* m) {
     return g_orig_body(target, m);
 }
 
-
 // The wheels' setters (twins of the FH2 tire / wheel hooks): the matrix is a stack scratch passed to both in turn. The wheels were built
 // from the lowered body matrix, so they are lifted back by the drop, and leaned for the negative camber. The scratch is put back after
 // each call because the second setter gets the same buffer.
@@ -903,42 +904,30 @@ PartSetFn g_orig_tire = nullptr, g_orig_wheel = nullptr;
 uint64_t part_detour(PartSetFn orig, void* scene, unsigned wheel, float* m, void* ctx, void* aux) {
     float saved[16];
     bool changed = false;
-    if (g_vis_active && g_vis_car && m && wheel < 4) {
+    if (g_vis_active && g_wheel_ctx_player.load() && m && wheel < 8) {
         __try {
             const float e = g_vis_e.load();
-            char* iface   = *reinterpret_cast<char**>(g_vis_car + kOffIface);
-            if (iface && e > 0.0f && readable(m, 64)) {
-                const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
-                const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
-                if (dx * dx + dy * dy + dz * dz < 9.0f) {
-                    std::memcpy(saved, m, 64);
-                    changed = true;
-                    // which side is this wheel on? lateral axis = the body's first row (seen at the body setter)
-                    const float* lat = g_body_rot;
-                    const float* up  = g_body_rot + 4;
-                    const float* fwd = g_body_rot + 8;
-                    const float dl   = dx * lat[0] + dy * lat[1] + dz * lat[2];
-                    const float side = dl > 0 ? 1.0f : -1.0f;
-                    m[13] += g_vis_drop_m * e;   // back to where the wheel was
-                    if (g_camber_on) {
-                        // the wheel's top must move toward the car: rotate the basis rows about the car's long axis through the hub
-                        const float cx = fwd[1] * up[2] - fwd[2] * up[1], cy = fwd[2] * up[0] - fwd[0] * up[2], cz = fwd[0] * up[1] - fwd[1] * up[0];   // fwd x up
-                        const float toward = -side * (cx * lat[0] + cy * lat[1] + cz * lat[2]);   // > 0 if +theta moves the top inward
-                        const float th = (toward >= 0 ? 1.0f : -1.0f) * g_camber_sign * g_vis_camber_deg * e * 0.01745329252f;
-                        const float cs = std::cos(th), sn = std::sin(th);
-                        const float ax = fwd[0], ay = fwd[1], az = fwd[2];
-                        for (int r = 0; r < 3; ++r) {
-                            float* v = m + r * 4;
-                            const float vx = v[0], vy = v[1], vz = v[2];
-                            const float kx = ay * vz - az * vy, ky = az * vx - ax * vz, kz = ax * vy - ay * vx;   // a x v
-                            const float d  = (ax * vx + ay * vy + az * vz) * (1.0f - cs);
-                            v[0] = vx * cs + kx * sn + ax * d;
-                            v[1] = vy * cs + ky * sn + ay * d;
-                            v[2] = vz * cs + kz * sn + az * d;
-                        }
+            if (e > 0.0f && readable(m, 64) && looks_matrix(m)) {
+                std::memcpy(saved, m, 64);
+                changed = true;
+                // The matrix is the wheel's, in the car's own frame (x lateral, y up, z forward): it moves with the body matrix, which was
+                // lowered by `drop` along the world's up. Undo that in the car's frame: drop times the world-up's components in it.
+                const float lift = g_vis_drop_m * e;
+                m[12] += lift * g_body_rot[1];
+                m[13] += lift * g_body_rot[5];
+                m[14] += lift * g_body_rot[9];
+                if (g_camber_on) {
+                    const float side = m[12] > 0 ? 1.0f : -1.0f;
+                    const float th   = side * g_camber_sign * g_vis_camber_deg * e * 0.01745329252f;   // top of the wheel toward the car
+                    const float cs = std::cos(th), sn = std::sin(th);
+                    for (int r = 0; r < 3; ++r) {   // rotate each basis row about the car's z axis (through the hub)
+                        float* v = m + r * 4;
+                        const float vx = v[0], vy = v[1];
+                        v[0] = vx * cs - vy * sn;
+                        v[1] = vx * sn + vy * cs;
                     }
-                    g_wheel_hits.fetch_add(1);
                 }
+                g_wheel_hits.fetch_add(1);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             changed = false;
