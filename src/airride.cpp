@@ -72,6 +72,7 @@ int g_price           = 3000;
 bool g_verbose        = true;
 bool g_probe          = true;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
 bool g_visual         = true;   // lower the picture only: the car's render parts move, the physics does not (Visual=0: the physical lowering)
+int g_camber_sign     = 1;      // CamberSign=-1 if the wheels lean the wrong way in the visual mode
 
 std::wstring g_cfg_path;
 
@@ -111,6 +112,7 @@ void load_config() {
     g_verbose        = cfg_int(L"Log", 1) != 0;
     g_probe          = cfg_int(L"Probe", 1) != 0;
     g_visual         = cfg_int(L"Visual", 1) != 0;
+    g_camber_sign    = cfg_int(L"CamberSign", 1) < 0 ? -1 : 1;
     if (g_default_drop < 1) g_default_drop = 1;
     if (g_default_drop > 10) g_default_drop = 10;
     if (g_hold_ms < 200) g_hold_ms = 200;
@@ -221,7 +223,7 @@ bool looks_matrix(const float* m) {   // 3 unit rows (rotation) + a position
     return true;
 }
 
-struct Part { char* obj; size_t off; float base_y; float last_y; bool wheel; uintptr_t vt; };
+struct Part { char* obj; size_t off; float base_y; float last_y; bool wheel; uintptr_t vt; float base_r[9]; float last_r[9]; float side; };
 Part g_parts[64];
 std::atomic<int> g_nparts{0};
 std::atomic<int> g_parts_ready{0};
@@ -259,7 +261,9 @@ void probe_scan(char* car) {
                     for (size_t cand : {size_t(0x30), size_t(0x20)}) if (readable(o + cand, 64) && looks_matrix(reinterpret_cast<const float*>(o + cand))) { moff = cand; break; }
                     if (moff && vt != kVtDriver && np < 64) {
                         const float* m = reinterpret_cast<const float*>(o + moff);
-                        tmp[np++] = {o, moff, m[13], m[13], std::fabs(m[12]) > 0.3f && std::fabs(m[14]) > 0.5f, vt + reinterpret_cast<uintptr_t>(g_game)};
+                        tmp[np] = {o, moff, m[13], m[13], std::fabs(m[12]) > 0.3f && std::fabs(m[14]) > 0.5f, vt + reinterpret_cast<uintptr_t>(g_game), {}, {}, m[12] > 0 ? 1.0f : -1.0f};
+                        for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) tmp[np].base_r[r * 3 + c] = tmp[np].last_r[r * 3 + c] = m[r * 4 + c];
+                        ++np;
                     }
                     const float* m = moff ? reinterpret_cast<const float*>(o + moff) : nullptr;
                     say("probe: %s at %p (depth %d) vt %s matrix +0x%zX pos (%.3f, %.3f, %.3f)", tag, static_cast<const void*>(o), it.depth,
@@ -412,7 +416,7 @@ char* g_vis_car = nullptr;
 bool g_vis_pending = false;
 int g_vis_target = 0;
 float g_vis_p = 0, g_vis_drop_m = 0;
-int g_vis_rewrites = 0;
+int g_vis_rewrites = 0, g_vis_wheel_rewrites = 0;
 bool g_vis_active = false;
 
 bool part_alive(const Part& pt) {
@@ -423,20 +427,41 @@ bool part_alive(const Part& pt) {
     }
 }
 
+float g_vis_camber_deg = 0;
+
 void vis_write(float e) {
     const int n = g_nparts.load();
     for (int i = 0; i < n; ++i) {
         Part& pt = g_parts[i];
-        if (pt.wheel || !part_alive(pt)) continue;
-        float* y = reinterpret_cast<float*>(pt.obj + pt.off) + 13;
+        if (!part_alive(pt)) continue;
+        float* m = reinterpret_cast<float*>(pt.obj + pt.off);
         __try {
-            const float cur = *y;
-            if (std::fabs(cur - pt.last_y) > 1e-4f) {   // the game wrote the matrix since: start from what it wrote
-                pt.base_y = cur;
-                ++g_vis_rewrites;
+            if (!pt.wheel) {
+                const float cur = m[13];
+                if (std::fabs(cur - pt.last_y) > 1e-4f) {   // the game wrote the matrix since: start from what it wrote
+                    pt.base_y = cur;
+                    ++g_vis_rewrites;
+                }
+                pt.last_y = pt.base_y - g_vis_drop_m * e;
+                m[13]     = pt.last_y;
+            } else if (g_camber_on) {
+                float diff = 0;
+                for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) diff = std::fmax(diff, std::fabs(m[r * 4 + c] - pt.last_r[r * 3 + c]));
+                if (diff > 1e-4f) {
+                    for (int r = 0; r < 3; ++r) for (int c = 0; c < 3; ++c) pt.base_r[r * 3 + c] = m[r * 4 + c];
+                    ++g_vis_wheel_rewrites;
+                }
+                // negative camber: the top of the wheel leans toward the car (rotation about the car's long axis, z)
+                const float th = pt.side * g_camber_sign * g_vis_camber_deg * e * 0.01745329252f;
+                const float cs = std::cos(th), sn = std::sin(th);
+                for (int r = 0; r < 3; ++r) {
+                    const float x = pt.base_r[r * 3], y = pt.base_r[r * 3 + 1], z = pt.base_r[r * 3 + 2];
+                    pt.last_r[r * 3]     = x * cs - y * sn;
+                    pt.last_r[r * 3 + 1] = x * sn + y * cs;
+                    pt.last_r[r * 3 + 2] = z;
+                    m[r * 4] = pt.last_r[r * 3]; m[r * 4 + 1] = pt.last_r[r * 3 + 1]; m[r * 4 + 2] = pt.last_r[r * 3 + 2];
+                }
             }
-            pt.last_y = pt.base_y - g_vis_drop_m * e;
-            *y        = pt.last_y;
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
@@ -474,9 +499,11 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
         const int cm  = drop_for(garage);
         g_vis_drop_m  = cm * 0.01f;
         g_vis_rewrites = 0;
+        g_vis_wheel_rewrites = 0;
+        g_vis_camber_deg = g_camber_per_cm * cm;
         int moving = 0;
         for (int i = 0; i < g_nparts.load(); ++i) if (!g_parts[i].wheel) ++moving;
-        say("airride(visual): %d render parts found, %d of them move (the rest are wheels); lowering %d cm", g_nparts.load(), moving, cm);
+        say("airride(visual): %d render parts found, %d of them move down, %d wheel parts lean by %.2f deg; lowering %d cm", g_nparts.load(), moving, g_nparts.load() - moving, g_camber_on ? static_cast<double>(g_vis_camber_deg) : 0.0, cm);
         if (moving > 0) {
             g_vis_active = true;
             g_vis_target = 1;
@@ -496,7 +523,7 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
         static int last_state = -1;
         if (last_state != g_vis_target) {
-            say("airride(visual): %s (the game rewrote the parts' matrices %d times meanwhile)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites);
+            say("airride(visual): %s (the game rewrote the body parts %d times, the wheel parts %d times meanwhile)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_vis_wheel_rewrites);
             last_state = g_vis_target;
         }
         if (!g_vis_target) { last_state = -1; vis_forget(); }
