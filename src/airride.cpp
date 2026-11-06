@@ -896,7 +896,7 @@ uint64_t detour_body(void* target, float* m) {
             if (iface && readable(m, 64)) {
                 const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
                 const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
-                const bool near_player = dx * dx + dy * dy + dz * dz < 4.0f;
+                const bool near_player = dx * dx + dz * dz < 0.25f && std::fabs(dy) < 1.5f;   // the player's own body: its matrix sits within a few cm (horizontally) of the dynamics' position; another car beside it is more than a metre off
                 if (ret == 0x1E32C05) t_wheel_ctx_player = near_player ? 1 : 0;
                 const float e = g_vis_e.load();
                 if (g_vis_active && near_player && e > 0.0f) {
