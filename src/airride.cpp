@@ -864,6 +864,8 @@ uint64_t detour_cache(void* self) {
 typedef uint64_t (*BodySetFn)(void*, float*);
 BodySetFn g_orig_body = nullptr;
 uint64_t detour_body(void* target, float* m) {
+    float restore_y = 0;
+    float* restore_m = nullptr;
     if (g_vis_active && m && g_vis_car) {
         __try {
             const float e = g_vis_e.load();
@@ -879,14 +881,18 @@ uint64_t detour_body(void* target, float* m) {
                             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game)),
                             static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
                     }
-                    m[13] -= g_vis_drop_m * e;
+                    restore_m = m;
+                    restore_y = g_vis_drop_m * e;
+                    m[13] -= restore_y;   // the scene's body node takes this; the caller's own copy is put back below (the wheels are built from it)
                     g_body_hits.fetch_add(1);
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
-    return g_orig_body(target, m);
+    const uint64_t r = g_orig_body(target, m);
+    if (restore_m) restore_m[13] += restore_y;
+    return r;
 }
 
 typedef uint64_t (*CarUpdateFn)(void*, float);
