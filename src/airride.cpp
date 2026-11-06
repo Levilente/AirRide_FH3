@@ -231,8 +231,9 @@ std::atomic<int> g_parts_ready{0};
 
 void probe_scan(char* car) {
     constexpr size_t kMax = 6000;
-    struct Item { const char* p; int depth; };
+    struct Item { const char* p; int depth; int parent; unsigned off; };
     static Item queue[kMax];
+    int world_hits = 0;
     static const char* seen[1 << 14];
     std::memset(seen, 0, sizeof seen);
     size_t head = 0, tail = 0, found = 0;
@@ -245,10 +246,11 @@ void probe_scan(char* car) {
         seen[h] = q;
         return true;
     };
-    queue[tail++] = {car, 0};
+    queue[tail++] = {car, 0, -1, 0};
     mark(car);
     say("probe: scanning from the Car %p", static_cast<void*>(car));
     while (head < tail && found < 80 && GetTickCount64() - t0 < 4000) {
+        const int self = static_cast<int>(head);
         const Item it = queue[head++];
         __try {
             if (!readable(it.p, 0x40)) continue;
@@ -273,6 +275,21 @@ void probe_scan(char* car) {
                 ++found;
                 continue;
             }
+            if (world_hits < 150 && readable(it.p, 0x400)) {
+                for (size_t off = 0; off + 64 <= 0x400; off += 16) {
+                    const float* m = reinterpret_cast<const float*>(it.p + off);
+                    if (!looks_matrix(m)) continue;
+                    if (std::fabs(m[12]) < 3.0f && std::fabs(m[13]) < 3.0f && std::fabs(m[14]) < 3.0f) continue;
+                    if (++world_hits > 150) break;
+                    char chain[160];
+                    int n = 0;
+                    for (int c = self; c >= 0 && n < 140; c = queue[c].parent)
+                        n += snprintf(chain + n, sizeof chain - n, "%s%X", c == self ? "" : "<-", queue[c].off);
+                    say("probe: world matrix in %p (vt %llX) at +0x%zX pos (%.2f, %.2f, %.2f) via %s", static_cast<const void*>(it.p),
+                        static_cast<unsigned long long>(*reinterpret_cast<const uintptr_t*>(it.p) - reinterpret_cast<uintptr_t>(g_game)), off,
+                        static_cast<double>(m[12]), static_cast<double>(m[13]), static_cast<double>(m[14]), chain);
+                }
+            }
             if (it.depth >= 4) continue;
             // one readable() check per object, then plain reads inside __try
             const size_t span = readable(it.p, 0x400) ? 0x400 : 0x40;
@@ -280,7 +297,7 @@ void probe_scan(char* car) {
                 const char* q = *reinterpret_cast<const char* const*>(it.p + off);
                 const uintptr_t v = reinterpret_cast<uintptr_t>(q);
                 if (v < 0x10000 || v > 0x00007FFFFFFFFFFFull || (v & 7)) continue;
-                if (mark(q)) queue[tail++] = {q, it.depth + 1};
+                if (mark(q)) queue[tail++] = {q, it.depth + 1, self, static_cast<unsigned>(off)};
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
