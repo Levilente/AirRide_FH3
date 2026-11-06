@@ -613,6 +613,7 @@ bool part_alive(const Part& pt) {
 float g_vis_camber_deg = 0;
 
 CRITICAL_SECTION g_vis_cs;
+std::atomic<int> g_cache_calls{0};
 std::atomic<float> g_vis_e{0};
 std::atomic<int> g_vis_thread_on{0};
 
@@ -624,11 +625,9 @@ void vis_write(float e) {
     LeaveCriticalSection(&g_vis_cs);
 }
 
-void vis_write_locked(float e) {
-    const int n = g_nparts.load();
-    for (int i = 0; i < n; ++i) {
-        Part& pt = g_parts[i];
-        if (!part_alive(pt)) continue;
+void vis_write_part(Part& pt, float e) {
+    {
+        if (!part_alive(pt)) return;
         float* m = reinterpret_cast<float*>(pt.obj + pt.off);
         __try {
             if (!pt.wheel) {
@@ -660,6 +659,12 @@ void vis_write_locked(float e) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
+}
+
+
+void vis_write_locked(float e) {
+    const int n = g_nparts.load();
+    for (int i = 0; i < n; ++i) vis_write_part(g_parts[i], e);
 }
 
 void vis_forget() {
@@ -701,7 +706,6 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
                 g_nparts.store(n);
                 g_parts_ready.store(1);
                 g_vis_pending = true;
-                trace_arm();
             } else {
                 say("airride(visual): found no body matrix: nothing to move");
             }
@@ -720,7 +724,6 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
         if (moving > 0) {
             g_vis_active = true;
             g_vis_target = 1;
-            g_vis_thread_on.store(1);
         } else {
             vis_forget();
         }
@@ -738,7 +741,7 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
         static int last_state = -1;
         if (last_state != g_vis_target) {
-            say("airride(visual): %s (the game rewrote the body parts %d times, the wheel parts %d times meanwhile)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_vis_wheel_rewrites);
+            say("airride(visual): %s (the game rewrote the body matrix %d times; the cache hook ran %d times)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_cache_calls.load());
             last_state = g_vis_target;
         }
         if (!g_vis_target) { last_state = -1; vis_forget(); }
@@ -831,6 +834,26 @@ void step(char* car, float dt) {
 }
 
 // ---- hooks -------------------------------------------------------------------------------------------------------------
+
+// game+0x1B41CC0 refreshes a body object's cached matrix (this+0x20, 64 bytes, copied from its source when stale) and its caller
+// reads the cache right away (found with the page-guard trace). Changing the cache after the original runs is seen by that reader.
+typedef uint64_t (*CacheFn)(void*);
+CacheFn g_orig_cache = nullptr;
+uint64_t detour_cache(void* self) {
+    const uint64_t r = g_orig_cache(self);
+    if (g_vis_active && !g_trace_on.load()) {
+        const int n = g_nparts.load();
+        for (int i = 0; i < n; ++i) {
+            if (g_parts[i].obj != static_cast<char*>(self)) continue;
+            EnterCriticalSection(&g_vis_cs);
+            vis_write_part(g_parts[i], g_vis_e.load());
+            LeaveCriticalSection(&g_vis_cs);
+            g_cache_calls.fetch_add(1);
+        }
+    }
+    return r;
+}
+
 typedef uint64_t (*CarUpdateFn)(void*, float);
 CarUpdateFn g_orig_car_update = nullptr;
 uint64_t detour_car_update(void* self, float dt) {
@@ -868,6 +891,10 @@ DWORD WINAPI install_hooks(LPVOID) {
                                        reinterpret_cast<void**>(&g_orig_car_update));
     FH3Hook* h2 = g_api->hook_function(g_mod, "HUD controller (Airride: the player's car)", g_game + kRvaHudCtrl, reinterpret_cast<void*>(&detour_hud),
                                        reinterpret_cast<void**>(&g_orig_hud));
+    FH3Hook* h3 = g_api->hook_function(g_mod, "body matrix cache (Airride)", g_game + 0x1B41CC0, reinterpret_cast<void*>(&detour_cache),
+                                       reinterpret_cast<void**>(&g_orig_cache));
+    if (h3) g_api->enable_hooks(g_mod, h3);
+    say("hooks: body matrix cache %s", h3 ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
     const bool b = h2 && g_api->enable_hooks(g_mod, h2);
     say("hooks: Car update %s, HUD controller %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
