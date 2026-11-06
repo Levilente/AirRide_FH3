@@ -233,7 +233,10 @@ void probe_scan(char* car) {
     constexpr size_t kMax = 6000;
     struct Item { const char* p; int depth; int parent; unsigned off; };
     static Item queue[kMax];
-    int world_hits = 0;
+    struct Hit { const char* obj; size_t off; uintptr_t vt; float pos[3]; char chain[96]; };
+    constexpr int kMaxHits = 2500;
+    static Hit hits[kMaxHits];
+    int nhits = 0;
     static const char* seen[1 << 14];
     std::memset(seen, 0, sizeof seen);
     size_t head = 0, tail = 0, found = 0;
@@ -275,19 +278,17 @@ void probe_scan(char* car) {
                 ++found;
                 continue;
             }
-            if (world_hits < 150 && readable(it.p, 0x400)) {
-                for (size_t off = 0; off + 64 <= 0x400; off += 16) {
+            if (nhits < kMaxHits && readable(it.p, 0x400)) {
+                for (size_t off = 0; off + 64 <= 0x400 && nhits < kMaxHits; off += 16) {
                     const float* m = reinterpret_cast<const float*>(it.p + off);
                     if (!looks_matrix(m)) continue;
                     if (std::fabs(m[12]) < 3.0f && std::fabs(m[13]) < 3.0f && std::fabs(m[14]) < 3.0f) continue;
-                    if (++world_hits > 150) break;
-                    char chain[160];
+                    Hit& h = hits[nhits++];
+                    h.obj = it.p; h.off = off; h.vt = *reinterpret_cast<const uintptr_t*>(it.p) - reinterpret_cast<uintptr_t>(g_game);
+                    h.pos[0] = m[12]; h.pos[1] = m[13]; h.pos[2] = m[14];
                     int n = 0;
-                    for (int c = self; c >= 0 && n < 140; c = queue[c].parent)
-                        n += snprintf(chain + n, sizeof chain - n, "%s%X", c == self ? "" : "<-", queue[c].off);
-                    say("probe: world matrix in %p (vt %llX) at +0x%zX pos (%.2f, %.2f, %.2f) via %s", static_cast<const void*>(it.p),
-                        static_cast<unsigned long long>(*reinterpret_cast<const uintptr_t*>(it.p) - reinterpret_cast<uintptr_t>(g_game)), off,
-                        static_cast<double>(m[12]), static_cast<double>(m[13]), static_cast<double>(m[14]), chain);
+                    for (int c = self; c >= 0 && n < 90; c = queue[c].parent)
+                        n += snprintf(h.chain + n, sizeof h.chain - n, "%s%X", c == self ? "" : "<-", queue[c].off);
                 }
             }
             if (it.depth >= 4) continue;
@@ -300,6 +301,42 @@ void probe_scan(char* car) {
                 if (mark(q)) queue[tail++] = {q, it.depth + 1, self, static_cast<unsigned>(off)};
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    // Where is the car in the physics? Look for world-sized float triples in the car and its dynamics object, then list the
+    // matrices stored within 5 m of each: the body's and the wheels' render matrices should be among them.
+    {
+        float cand[6][3];
+        int ncand = 0;
+        __try {
+            char* iface = *reinterpret_cast<char**>(car + kOffIface);
+            const char* regions[2] = {iface ? iface - kIfaceToDyn : nullptr, car};
+            const char* names[2]   = {"dyn", "car"};
+            for (int r = 0; r < 2; ++r) {
+                if (!regions[r]) continue;
+                for (size_t off = 0; off + 12 <= 0x1000 && ncand < 6; off += 4) {
+                    if (!readable(regions[r] + off, 12)) break;
+                    const float* f = reinterpret_cast<const float*>(regions[r] + off);
+                    if (!std::isfinite(f[0]) || !std::isfinite(f[1]) || !std::isfinite(f[2])) continue;
+                    if (std::fabs(f[0]) < 100 || std::fabs(f[2]) < 100 || std::fabs(f[0]) > 50000 || std::fabs(f[2]) > 50000 || std::fabs(f[1]) > 3000) continue;
+                    say("probe: %s +0x%zX holds a world position (%.2f, %.2f, %.2f)", names[r], off, static_cast<double>(f[0]), static_cast<double>(f[1]), static_cast<double>(f[2]));
+                    bool dup = false;
+                    for (int k = 0; k < ncand; ++k) if (std::fabs(cand[k][0] - f[0]) < 0.5f && std::fabs(cand[k][2] - f[2]) < 0.5f) dup = true;
+                    if (!dup) { cand[ncand][0] = f[0]; cand[ncand][1] = f[1]; cand[ncand][2] = f[2]; ++ncand; }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+        for (int k = 0; k < ncand && k < 3; ++k) {
+            int printed = 0;
+            say("probe: matrices within 5 m of (%.2f, %.2f, %.2f):", static_cast<double>(cand[k][0]), static_cast<double>(cand[k][1]), static_cast<double>(cand[k][2]));
+            for (int i = 0; i < nhits && printed < 90; ++i) {
+                const float dx = hits[i].pos[0] - cand[k][0], dy = hits[i].pos[1] - cand[k][1], dz = hits[i].pos[2] - cand[k][2];
+                if (dx * dx + dy * dy + dz * dz > 25.0f) continue;
+                ++printed;
+                say("probe:   %p (vt %llX) +0x%zX rel (%.2f, %.2f, %.2f) via %s", static_cast<const void*>(hits[i].obj), static_cast<unsigned long long>(hits[i].vt),
+                    hits[i].off, static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz), hits[i].chain);
+            }
         }
     }
     if (g_visual) {
