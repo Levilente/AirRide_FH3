@@ -616,6 +616,7 @@ float g_vis_camber_deg = 0;
 CRITICAL_SECTION g_vis_cs;
 std::atomic<int> g_cache_calls{0};
 std::atomic<int> g_body_hits{0};
+std::atomic<int> g_wc[2][8][2];   // [tire/wheel setter][wheel index][corrected?] while lowered
 float g_body_rot[12], g_body_pos[3];
 std::atomic<int> g_wheel_hits{0};
 std::atomic<float> g_vis_e{0};
@@ -745,6 +746,15 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     vis_write(g_vis_e.load());
     if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
         static int last_state = -1;
+        if (last_state != g_vis_target && g_vis_target == 1) {
+            for (int k = 0; k < 2; ++k) {
+                char line[300];
+                int n = snprintf(line, sizeof line, "airride(visual): %s setter calls (idx: corrected/not):", k ? "wheel" : "tire");
+                for (int w = 0; w < 8; ++w) n += snprintf(line + n, sizeof line - n, " %d:%d/%d", w, g_wc[k][w][1].load(), g_wc[k][w][0].load());
+                say("%s", line);
+            }
+            for (int k = 0; k < 2; ++k) for (int w = 0; w < 8; ++w) { g_wc[k][w][0].store(0); g_wc[k][w][1].store(0); }
+        }
         if (last_state != g_vis_target) {
             say("airride(visual): %s (the game rewrote the body matrix %d times; the cache hook ran %d times, the body setter was changed %d times, the wheel setters %d times)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_cache_calls.load(), g_body_hits.load(), g_wheel_hits.load());
             last_state = g_vis_target;
@@ -901,10 +911,15 @@ uint64_t detour_body(void* target, float* m) {
 typedef uint64_t (*PartSetFn)(void*, unsigned, float*, void*, void*);
 PartSetFn g_orig_tire = nullptr, g_orig_wheel = nullptr;
 
-uint64_t part_detour(PartSetFn orig, void* scene, unsigned wheel, float* m, void* ctx, void* aux) {
+std::atomic<void*> g_player_scene{nullptr};
+uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, float* m, void* ctx, void* aux) {
     float saved[16];
     bool changed = false;
-    if (g_vis_active && g_wheel_ctx_player.load() && m && wheel < 8) {
+    const bool flag = g_wheel_ctx_player.load() != 0;
+    if (flag && g_vis_active) g_player_scene.store(scene);
+    const bool mine = g_vis_active && (flag || scene == g_player_scene.load());
+    if (g_vis_active && g_vis_e.load() > 0.0f && wheel < 8) g_wc[kind][wheel][mine ? 1 : 0].fetch_add(1);
+    if (mine && m && wheel < 8) {
         __try {
             const float e = g_vis_e.load();
             if (e > 0.0f && readable(m, 64) && std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]) && std::fabs(m[12]) < 20.0f && std::fabs(m[13]) < 20.0f && std::fabs(m[14]) < 20.0f) {
@@ -937,8 +952,8 @@ uint64_t part_detour(PartSetFn orig, void* scene, unsigned wheel, float* m, void
     if (changed) std::memcpy(m, saved, 64);
     return r;
 }
-uint64_t detour_tire(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(g_orig_tire, scene, wheel, m, ctx, aux); }
-uint64_t detour_wheel(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(g_orig_wheel, scene, wheel, m, ctx, aux); }
+uint64_t detour_tire(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(0, g_orig_tire, scene, wheel, m, ctx, aux); }
+uint64_t detour_wheel(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(1, g_orig_wheel, scene, wheel, m, ctx, aux); }
 
 typedef uint64_t (*CarUpdateFn)(void*, float);
 CarUpdateFn g_orig_car_update = nullptr;
