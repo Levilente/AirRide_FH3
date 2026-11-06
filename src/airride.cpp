@@ -70,6 +70,7 @@ float g_below_min_cm  = 1.5f;  // how far under the game's own lowest ride heigh
 bool g_camber_on      = true;
 int g_price           = 3000;
 bool g_verbose        = true;
+bool g_probe          = true;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
 
 std::wstring g_cfg_path;
 
@@ -107,6 +108,7 @@ void load_config() {
     g_camber_on      = cfg_int(L"Camber", 1) != 0;
     g_price          = cfg_int(L"Price", g_price);
     g_verbose        = cfg_int(L"Log", 1) != 0;
+    g_probe          = cfg_int(L"Probe", 1) != 0;
     if (g_default_drop < 1) g_default_drop = 1;
     if (g_default_drop > 10) g_default_drop = 10;
     if (g_hold_ms < 200) g_hold_ms = 200;
@@ -199,6 +201,71 @@ bool reapply(char* car) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
+}
+
+
+// ---- probe: finds the car's render model objects (CarRenderModel11, DriverModel) and logs their 4x4 matrices -------------------
+// Visual-only lowering needs the places where the game stores the body / driver / steering wheel / wheel transforms for drawing.
+// This walks the objects reachable from the Car and logs what it finds, so the offsets can be read from the log.
+constexpr uintptr_t kVtCarRender1 = 0x4675B40, kVtCarRender2 = 0x4675B50, kVtDriver = 0x468E728;
+
+
+bool looks_matrix(const float* m) {   // 3 unit rows (rotation) + a position
+    for (int r = 0; r < 3; ++r) {
+        const float l = m[r * 4] * m[r * 4] + m[r * 4 + 1] * m[r * 4 + 1] + m[r * 4 + 2] * m[r * 4 + 2];
+        if (!(l > 0.95f && l < 1.05f)) return false;
+    }
+    for (int k = 12; k < 15; ++k) if (!std::isfinite(m[k]) || std::fabs(m[k]) > 1e6f) return false;
+    return true;
+}
+
+void probe_object(const char* tag, const char* obj, size_t span) {
+    say("probe: %s object %p", tag, static_cast<const void*>(obj));
+    for (size_t off = 0; off + 64 <= span; off += 16) {
+        if (!readable(obj + off, 64)) break;
+        const float* m = reinterpret_cast<const float*>(obj + off);
+        if (looks_matrix(m)) {
+            say("probe:   %s +0x%zX matrix pos (%.3f, %.3f, %.3f) row0 (%.2f %.2f %.2f)", tag, off, static_cast<double>(m[12]),
+                static_cast<double>(m[13]), static_cast<double>(m[14]), static_cast<double>(m[0]), static_cast<double>(m[1]), static_cast<double>(m[2]));
+        }
+    }
+}
+
+void probe_scan(char* car) {
+    struct Item { const char* p; int depth; const char* via; };
+    static Item queue[30000];
+    size_t head = 0, tail = 0, found = 0;
+    queue[tail++] = {car, 0, "car"};
+    say("probe: scanning from the Car %p (game base %p)", static_cast<void*>(car), static_cast<void*>(g_game));
+    while (head < tail && found < 12) {
+        const Item it = queue[head++];
+        __try {
+            if (!readable(it.p, 0x40)) continue;
+            const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(it.p) - reinterpret_cast<uintptr_t>(g_game);
+            if (vt == kVtCarRender1 || vt == kVtCarRender2 || vt == kVtDriver) {
+                const char* tag = vt == kVtDriver ? "DriverModel" : "CarRenderModel";
+                say("probe: found %s at %p, reached by %s (depth %d)", tag, static_cast<const void*>(it.p), it.via, it.depth);
+                probe_object(tag, it.p, 0x500);
+                ++found;
+                continue;
+            }
+            if (it.depth >= 5) continue;
+            for (size_t off = 8; off < 0x800 && tail < 30000; off += 8) {
+                if (!readable(it.p + off, 8)) break;
+                const char* q = *reinterpret_cast<const char* const*>(it.p + off);
+                if (reinterpret_cast<uintptr_t>(q) < 0x10000 || reinterpret_cast<uintptr_t>(q) > 0x00007FFFFFFFFFFFull || (reinterpret_cast<uintptr_t>(q) & 7)) continue;
+                bool seen = false;
+                for (size_t k = 0; k < tail && k < 4000; ++k) if (queue[k].p == q) { seen = true; break; }
+                if (!seen) {
+                    static char via[30000][24];
+                    snprintf(via[tail], 24, "%s+0x%zX", it.depth ? "..." : "car", off);
+                    queue[tail++] = {q, it.depth + 1, via[tail - 1]};
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+    say("probe: done, %zu objects visited, %zu render objects found", tail, found);
 }
 
 float ease(float x) {   // smoothstep: ease in, ease out
@@ -330,6 +397,7 @@ void step(char* car, float dt) {
     const bool driving = GetTickCount64() - g_hud_tick.load() < 600;
 
     const int req = g_request.exchange(0);
+    if (req && g_probe) { probe_scan(car); }
     if (req) {
         if (g_target == 1 || g_p > 0) {
             g_target = 0;
