@@ -71,6 +71,7 @@ bool g_camber_on      = true;
 int g_price           = 3000;
 bool g_verbose        = true;
 bool g_probe          = true;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
+bool g_visual         = true;   // lower the picture only: the car's render parts move, the physics does not (Visual=0: the physical lowering)
 
 std::wstring g_cfg_path;
 
@@ -109,6 +110,7 @@ void load_config() {
     g_price          = cfg_int(L"Price", g_price);
     g_verbose        = cfg_int(L"Log", 1) != 0;
     g_probe          = cfg_int(L"Probe", 1) != 0;
+    g_visual         = cfg_int(L"Visual", 1) != 0;
     if (g_default_drop < 1) g_default_drop = 1;
     if (g_default_drop > 10) g_default_drop = 10;
     if (g_hold_ms < 200) g_hold_ms = 200;
@@ -219,17 +221,11 @@ bool looks_matrix(const float* m) {   // 3 unit rows (rotation) + a position
     return true;
 }
 
-void probe_object(const char* tag, const char* obj, size_t span) {
-    say("probe: %s object %p", tag, static_cast<const void*>(obj));
-    for (size_t off = 0; off + 64 <= span; off += 16) {
-        if (!readable(obj + off, 64)) break;
-        const float* m = reinterpret_cast<const float*>(obj + off);
-        if (looks_matrix(m)) {
-            say("probe:   %s +0x%zX matrix pos (%.3f, %.3f, %.3f) row0 (%.2f %.2f %.2f)", tag, off, static_cast<double>(m[12]),
-                static_cast<double>(m[13]), static_cast<double>(m[14]), static_cast<double>(m[0]), static_cast<double>(m[1]), static_cast<double>(m[2]));
-        }
-    }
-}
+struct Part { char* obj; size_t off; float base_y; float last_y; bool wheel; uintptr_t vt; };
+Part g_parts[64];
+std::atomic<int> g_nparts{0};
+std::atomic<int> g_parts_ready{0};
+
 
 void probe_scan(char* car) {
     constexpr size_t kMax = 6000;
@@ -238,6 +234,8 @@ void probe_scan(char* car) {
     static const char* seen[1 << 14];
     std::memset(seen, 0, sizeof seen);
     size_t head = 0, tail = 0, found = 0;
+    static Part tmp[64];
+    int np = 0;
     const ULONGLONG t0 = GetTickCount64();
     auto mark = [&](const char* q) {   // true if new
         size_t h = (reinterpret_cast<uintptr_t>(q) >> 3) * 0x9E3779B1u & ((1 << 14) - 1);
@@ -248,15 +246,26 @@ void probe_scan(char* car) {
     queue[tail++] = {car, 0};
     mark(car);
     say("probe: scanning from the Car %p", static_cast<void*>(car));
-    while (head < tail && found < 12 && GetTickCount64() - t0 < 4000) {
+    while (head < tail && found < 80 && GetTickCount64() - t0 < 4000) {
         const Item it = queue[head++];
         __try {
             if (!readable(it.p, 0x40)) continue;
             const uintptr_t vt = *reinterpret_cast<const uintptr_t*>(it.p) - reinterpret_cast<uintptr_t>(g_game);
             if (vt == kVtCarRender1 || vt == kVtCarRender2 || vt == kVtDriver) {
                 const char* tag = vt == kVtDriver ? "DriverModel" : "CarRenderModel";
-                say("probe: found %s at %p (depth %d)", tag, static_cast<const void*>(it.p), it.depth);
-                probe_object(tag, it.p, 0x500);
+                {
+                    char* o = const_cast<char*>(it.p);
+                    size_t moff = 0;
+                    for (size_t cand : {size_t(0x30), size_t(0x20)}) if (readable(o + cand, 64) && looks_matrix(reinterpret_cast<const float*>(o + cand))) { moff = cand; break; }
+                    if (moff && vt != kVtDriver && np < 64) {
+                        const float* m = reinterpret_cast<const float*>(o + moff);
+                        tmp[np++] = {o, moff, m[13], m[13], std::fabs(m[12]) > 0.3f && std::fabs(m[14]) > 0.5f, vt + reinterpret_cast<uintptr_t>(g_game)};
+                    }
+                    const float* m = moff ? reinterpret_cast<const float*>(o + moff) : nullptr;
+                    say("probe: %s at %p (depth %d) vt %s matrix +0x%zX pos (%.3f, %.3f, %.3f)", tag, static_cast<const void*>(o), it.depth,
+                        vt == kVtCarRender1 ? "b40" : vt == kVtCarRender2 ? "b50" : "driver", moff, m ? static_cast<double>(m[12]) : 0.0,
+                        m ? static_cast<double>(m[13]) : 0.0, m ? static_cast<double>(m[14]) : 0.0);
+                }
                 ++found;
                 continue;
             }
@@ -271,6 +280,11 @@ void probe_scan(char* car) {
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
+    }
+    if (g_visual) {
+        for (int i = 0; i < np; ++i) g_parts[i] = tmp[i];
+        g_nparts.store(np);
+        g_parts_ready.store(1);
     }
     say("probe: done, %zu objects visited in %llu ms, %zu render objects found", head, static_cast<unsigned long long>(GetTickCount64() - t0), found);
 }
@@ -392,6 +406,103 @@ void forget() {
     g_last_applied_p = -1;
 }
 
+
+// ---- visual-only lowering: the car's render parts (body, interior, lights ...) move down, the wheels and the physics stay ----------
+char* g_vis_car = nullptr;
+bool g_vis_pending = false;
+int g_vis_target = 0;
+float g_vis_p = 0, g_vis_drop_m = 0;
+int g_vis_rewrites = 0;
+bool g_vis_active = false;
+
+bool part_alive(const Part& pt) {
+    __try {
+        return readable(pt.obj, pt.off + 64) && *reinterpret_cast<const uintptr_t*>(pt.obj) == pt.vt;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+void vis_write(float e) {
+    const int n = g_nparts.load();
+    for (int i = 0; i < n; ++i) {
+        Part& pt = g_parts[i];
+        if (pt.wheel || !part_alive(pt)) continue;
+        float* y = reinterpret_cast<float*>(pt.obj + pt.off) + 13;
+        __try {
+            const float cur = *y;
+            if (std::fabs(cur - pt.last_y) > 1e-4f) {   // the game wrote the matrix since: start from what it wrote
+                pt.base_y = cur;
+                ++g_vis_rewrites;
+            }
+            pt.last_y = pt.base_y - g_vis_drop_m * e;
+            *y        = pt.last_y;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+}
+
+void vis_forget() {
+    g_vis_pending = false;
+    g_vis_target  = 0;
+    g_vis_p       = 0;
+    g_vis_active  = false;
+    g_parts_ready.store(0);
+    g_nparts.store(0);
+}
+
+void visual_step(char* car, float dt, int req, bool usable, bool driving, float speed, uint32_t garage) {
+    if (req) {
+        if (g_vis_active && (g_vis_target == 1 || g_vis_p > 0)) {
+            g_vis_target = 0;
+            say("airride(visual): raising");
+        } else if (!usable) {
+            say("airride: stick held, but this car has no Airride (or the garage car is another model)");
+        } else if (!driving) {
+            say("airride: stick held, but the HUD isn't up (menu or photo mode)");
+        } else if (speed > g_still_mps) {
+            say("airride: stick held, but the car isn't standing still (%.2f m/s)", static_cast<double>(speed));
+        } else if (!g_vis_pending) {
+            g_parts_ready.store(0);
+            g_vis_pending = true;
+            probe_start(car);
+            say("airride(visual): looking for the car's render parts");
+        }
+    }
+    if (g_vis_pending && g_parts_ready.load()) {
+        g_vis_pending = false;
+        const int cm  = drop_for(garage);
+        g_vis_drop_m  = cm * 0.01f;
+        g_vis_rewrites = 0;
+        int moving = 0;
+        for (int i = 0; i < g_nparts.load(); ++i) if (!g_parts[i].wheel) ++moving;
+        say("airride(visual): %d render parts found, %d of them move (the rest are wheels); lowering %d cm", g_nparts.load(), moving, cm);
+        if (moving > 0) {
+            g_vis_active = true;
+            g_vis_target = 1;
+        } else {
+            vis_forget();
+        }
+    }
+    if (!g_vis_active) return;
+    if (g_vis_target == 1 && (!usable || speed > g_raise_mps)) {
+        g_vis_target = 0;
+        say("airride(visual): %s, raising", !usable ? "the car lost its Airride" : "the car is moving");
+    }
+    float np = g_vis_p + (g_vis_target ? 1.0f : -1.0f) * (dt > 0.1f ? 0.1f : dt < 0 ? 0 : dt) / g_duration;
+    np       = np < 0 ? 0 : np > 1 ? 1 : np;
+    g_vis_p  = np;
+    vis_write(ease(g_vis_p));
+    if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
+        static int last_state = -1;
+        if (last_state != g_vis_target) {
+            say("airride(visual): %s (the game rewrote the parts' matrices %d times meanwhile)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites);
+            last_state = g_vis_target;
+        }
+        if (!g_vis_target) { last_state = -1; vis_forget(); }
+    }
+}
+
 // The player's Car, once a frame.
 void step(char* car, float dt) {
     char* spec = car + kOffSpec;
@@ -418,6 +529,11 @@ void step(char* car, float dt) {
     const bool driving = GetTickCount64() - g_hud_tick.load() < 600;
 
     const int req = g_request.exchange(0);
+    if (g_visual) {
+        if (car != g_vis_car) { vis_forget(); g_vis_car = car; }
+        visual_step(car, dt, req, usable, driving, speed, garage);
+        return;
+    }
     if (req && g_probe) probe_start(car);
     if (req) {
         if (g_target == 1 || g_p > 0) {
