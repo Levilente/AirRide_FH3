@@ -919,6 +919,8 @@ float preview_ease() {
     if (dt > 1.0f) { p = 0.0f; dt = 0.0f; }   // the shop wasn't drawn for a while: start from normal height
     if (dt > 0.1f) dt = 0.1f;
     const int stage = (g_api && g_api->api_version >= 15 && g_api->upgrade_preview_stage && g_handle >= 0) ? g_api->upgrade_preview_stage(g_mod, g_handle) : -1;
+    static std::atomic<int> last_stage{-2}, shown{0};
+    if (last_stage.exchange(stage) != stage && shown.fetch_add(1) < 60) say("garage preview: the list shows stage %d (ease %.2f)", stage, static_cast<double>(p));
     p += (stage > 0 ? dt : -dt) / 0.6f;
     p = p < 0.0f ? 0.0f : p > 1.0f ? 1.0f : p;
     g_pv_p.store(p);
