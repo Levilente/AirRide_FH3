@@ -906,8 +906,7 @@ void menu_diag(const char* what, uintptr_t ret, void* target, const float* m, un
 typedef uint64_t (*BodySetFn)(void*, float*);
 BodySetFn g_orig_body = nullptr;
 thread_local int t_wheel_ctx_player = 0;   // per thread (the game renders cars on several threads at once); the car whose body was just set from game+0x1E32C05 is the player's (its wheels follow in the same function)
-// Garage preview: while the garage's upgrade list has the cursor on the Airride stage, the shop's car (its matrix sits far below the
-// world, y about -1000) is lowered by PreviewCm, smoothly, and put back when the cursor leaves, the stage goes into the basket or the shop closes.
+// Garage preview: while the garage's upgrade list has the cursor on the Airride stage, the shop's car is lowered by PreviewCm, smoothly, and put back when the cursor leaves, the stage goes into the basket or the shop closes.
 float g_preview_cm = 3.0f;
 std::atomic<float> g_pv_p{0};
 std::atomic<ULONGLONG> g_pv_last{0};
@@ -957,7 +956,7 @@ uint64_t detour_body(void* target, float* m) {
                         }
                     }
                 }
-                if (!ctx && g_visual && m[13] < -500.0f && m[13] > -5000.0f) {   // the garage's showroom car
+                if (!ctx && g_visual) {   // the garage's showroom car (its position isn't known: while the upgrade list has the cursor on the Airride, every car drawn is lowered, only the shop's is on screen)
                     const float e = preview_ease();
                     if (e > 0.0f) {
                         ctx = true;
