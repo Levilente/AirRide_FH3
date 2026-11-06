@@ -66,6 +66,7 @@ int g_step_ms         = 33;     // the spec is re-applied at most this often whi
 float g_still_mps     = 0.5f;   // the car counts as standing still below this speed
 float g_raise_mps     = 2.0f;   // a lowered car that moves faster than this is raised again
 int g_height_mode     = 0;      // 0 shifts the suspension's ride height range, 1 lowers the ride-height tuning value
+float g_below_min_cm  = 1.5f;  // how far under the game's own lowest ride height (the tuning slider at 0) the car may be pushed
 bool g_camber_on      = true;
 int g_price           = 3000;
 bool g_verbose        = true;
@@ -102,6 +103,7 @@ void load_config() {
     g_still_mps      = cfg_float(L"StandstillMps", g_still_mps);
     g_raise_mps      = cfg_float(L"AutoRaiseMps", g_raise_mps);
     g_height_mode    = cfg_int(L"HeightMode", g_height_mode);
+    g_below_min_cm   = cfg_float(L"BelowMinCm", g_below_min_cm);
     g_camber_on      = cfg_int(L"Camber", 1) != 0;
     g_price          = cfg_int(L"Price", g_price);
     g_verbose        = cfg_int(L"Log", 1) != 0;
@@ -151,7 +153,7 @@ ULONGLONG g_last_step = 0;
 float g_last_applied_p = -1;
 // the spec values the lowering started from
 float g_base_min[2], g_base_max[2], g_base_tune_ride[2], g_base_camber[2];
-float g_drop_m = 0, g_cam_range = 0;        // metres, camber tuning range in degrees
+float g_drop_m = 0, g_cam_range = 0, g_room_cm = 0;        // metres, camber tuning range in degrees
 float g_written[8];                          // what the last apply wrote (to notice that the game rebuilt the spec)
 int g_garage_lowered = 0;
 
@@ -220,6 +222,16 @@ bool capture_base(char* spec, int drop_cm) {
                 return false;
             }
         }
+        // The suspension can't be pushed far under the lowest ride height the game itself allows (tuning slider at 0): the car
+        // would sink into the ground. Allowed drop = room left above that lowest height + BelowMinCm, the smaller of the axles.
+        float room = 1e9f;
+        for (int a = 0; a < 2; ++a) {
+            const float t   = g_base_tune_ride[a] < 0 ? 0 : g_base_tune_ride[a] > 1 ? 1 : g_base_tune_ride[a];
+            const float r   = (g_base_max[a] - g_base_min[a]) * t;   // above the lowest height
+            room            = r < room ? r : room;
+        }
+        g_room_cm = room * 100.0f + g_below_min_cm;
+        if (g_room_cm < 0) g_room_cm = 0;
         const float cmin = *reinterpret_cast<const float*>(g_game + kRvaCamberMin);
         const float cmax = *reinterpret_cast<const float*>(g_game + kRvaCamberMax);
         g_cam_range      = cmax - cmin;
@@ -331,11 +343,14 @@ void step(char* car, float dt) {
         } else {
             const int cm = drop_for(garage);
             if (capture_base(spec, cm)) {
+                const float eff = static_cast<float>(cm) < g_room_cm ? static_cast<float>(cm) : g_room_cm;
+                if (eff < static_cast<float>(cm))
+                    say("airride: %d cm asked, but this car is already low: only %.1f cm of room above the lowest safe height", cm, static_cast<double>(eff));
                 g_have_base = true;
-                g_drop_m    = cm * 0.01f;
+                g_drop_m    = eff * 0.01f;
                 g_garage_lowered = static_cast<int>(garage);
                 g_target    = 1;
-                say("airride: lowering %d cm", cm);
+                say("airride: lowering %.1f cm", static_cast<double>(eff));
             }
         }
     }
