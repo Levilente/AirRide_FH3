@@ -60,6 +60,7 @@ char* g_game           = nullptr;
 // fh3-mods\Airride.ini (written with these defaults on first start).
 int g_hold_ms         = 1000;   // how long the left stick is held to lower / raise
 int g_default_drop    = 5;      // cm, for a car whose slider was never touched
+bool g_menu_diag = true;
 float g_camber_per_cm = 0.65f;   // degrees of negative camber per cm of drop
 float g_duration      = 1.4f;   // seconds a lowering or raising takes
 int g_step_ms         = 33;     // the spec is re-applied at most this often while moving
@@ -885,10 +886,28 @@ uint64_t detour_cache(void* self) {
 // game+0x21FF980 is the FH3 twin of the FH2 body setter the StanceAirride mod intercepts: it copies the body's 4x4 matrix into the
 // scene's body node (this+0x10) and tail-jumps on. Three callers, like in FH2. The matrix is a scratch copy on the caller's stack, so
 // it can be changed before the original runs. Only a matrix within 2 m of the player's car (the dynamics' world position) is touched.
+
+// Diagnostics for a menu preview (the garage's upgrade list): while the HUD isn't running, the first calls of each 2 s are logged, 400 at most.
+void menu_diag(const char* what, uintptr_t ret, void* target, const float* m, unsigned wheel) {
+    if (!g_menu_diag || GetTickCount64() - g_hud_tick.load() < 1500) return;
+    static std::atomic<ULONGLONG> win{0};
+    static std::atomic<int> n{0}, total{0};
+    const ULONGLONG now = GetTickCount64();
+    if (now - win.load() > 2000) { win.store(now); n.store(0); }
+    if (n.fetch_add(1) >= 24 || total.fetch_add(1) >= 400) return;
+    __try {
+        if (m && readable(m, 64))
+            say("menu: %s ret game+0x%llX target %p wheel %u pos (%.3f, %.3f, %.3f) rows x(%.2f %.2f %.2f) y(%.2f %.2f %.2f) thread %lu", what, static_cast<unsigned long long>(ret), target, wheel,
+                static_cast<double>(m[12]), static_cast<double>(m[13]), static_cast<double>(m[14]), static_cast<double>(m[0]), static_cast<double>(m[1]), static_cast<double>(m[2]),
+                static_cast<double>(m[4]), static_cast<double>(m[5]), static_cast<double>(m[6]), GetCurrentThreadId());
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
 typedef uint64_t (*BodySetFn)(void*, float*);
 BodySetFn g_orig_body = nullptr;
 thread_local int t_wheel_ctx_player = 0;   // per thread (the game renders cars on several threads at once); the car whose body was just set from game+0x1E32C05 is the player's (its wheels follow in the same function)
 uint64_t detour_body(void* target, float* m) {
+    menu_diag("body", reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game), target, m, 99);
     if (g_vis_car && m) {
         __try {
             const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game);
@@ -924,6 +943,7 @@ typedef uint64_t (*PartSetFn)(void*, unsigned, float*, void*, void*);
 PartSetFn g_orig_tire = nullptr, g_orig_wheel = nullptr;
 
 uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, float* m, void* ctx, void* aux) {
+    menu_diag(kind == 0 ? "tire" : kind == 1 ? "wheel" : "brake part", 0, scene, m, wheel);
     float saved[16];
     bool changed = false;
     const bool flag = t_wheel_ctx_player != 0;
