@@ -72,6 +72,7 @@ int g_price           = 3000;
 bool g_verbose        = true;
 bool g_probe          = false;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
 bool g_visual         = true;   // lower the picture only: the car's render parts move, the physics does not (Visual=0: the physical lowering)
+bool g_trace          = true;   // log who reads and writes the body matrix for 2 s after a lowering request
 int g_camber_sign     = 1;      // CamberSign=-1 if the wheels lean the wrong way in the visual mode
 
 std::wstring g_cfg_path;
@@ -112,6 +113,7 @@ void load_config() {
     g_verbose        = cfg_int(L"Log", 1) != 0;
     g_probe          = cfg_int(L"Probe", 0) != 0;
     g_visual         = cfg_int(L"Visual", 1) != 0;
+    g_trace          = cfg_int(L"Trace", 1) != 0;
     g_camber_sign    = cfg_int(L"CamberSign", 1) < 0 ? -1 : 1;
     if (g_default_drop < 1) g_default_drop = 1;
     if (g_default_drop > 10) g_default_drop = 10;
@@ -461,6 +463,98 @@ void forget() {
 }
 
 
+
+// ---- trace: who writes and who reads the body matrix? (page guard on its page; the faulting instruction's address is the answer) ----
+
+struct TraceHit { uint64_t rip, addr, rw, stack[10]; DWORD tid; };
+TraceHit g_th[400];
+std::atomic<int> g_nth{0};
+std::atomic<int> g_trace_on{0};
+std::atomic<int> g_rearm{0};
+uintptr_t g_tr_lo[4], g_tr_hi[4], g_tr_page[4];
+DWORD g_tr_prot[4];
+int g_tr_n = 0;
+ULONGLONG g_tr_start = 0;
+
+LONG CALLBACK trace_veh(EXCEPTION_POINTERS* ep) {
+    const DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code == STATUS_SINGLE_STEP) {
+        if (g_rearm.exchange(0)) {
+            if (g_trace_on.load()) for (int i = 0; i < g_tr_n; ++i) { DWORD old; VirtualProtect(reinterpret_cast<void*>(g_tr_page[i]), 1, g_tr_prot[i] | PAGE_GUARD, &old); }
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (code != STATUS_GUARD_PAGE_VIOLATION || !g_trace_on.load()) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t addr = ep->ExceptionRecord->ExceptionInformation[1];
+    bool ours = false;
+    for (int i = 0; i < g_tr_n; ++i) if ((addr & ~uintptr_t(0xFFF)) == g_tr_page[i]) ours = true;
+    if (!ours) return EXCEPTION_CONTINUE_SEARCH;
+    for (int i = 0; i < g_tr_n; ++i) {
+        if (addr >= g_tr_lo[i] && addr < g_tr_hi[i]) {
+            const int k = g_nth.fetch_add(1);
+            if (k < 400) {
+                TraceHit& h = g_th[k];
+                h.rip = ep->ContextRecord->Rip; h.addr = addr; h.rw = ep->ExceptionRecord->ExceptionInformation[0]; h.tid = GetCurrentThreadId();
+                const uint64_t* sp = reinterpret_cast<const uint64_t*>(ep->ContextRecord->Rsp);
+                int n = 0;
+                const uint64_t lo = reinterpret_cast<uint64_t>(g_game), hi = lo + 0x3000000;
+                for (int j = 0; j < 48 && n < 10; ++j) { if (sp[j] >= lo && sp[j] < hi) h.stack[n++] = sp[j] - lo; }
+                while (n < 10) h.stack[n++] = 0;
+            }
+            break;
+        }
+    }
+    ep->ContextRecord->EFlags |= 0x100;   // single-step, then guard the page again
+    g_rearm.store(1);
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+void trace_arm() {
+    if (!g_trace || g_trace_on.load()) return;
+    g_tr_n = 0;
+    g_nth.store(0);
+    const int n = g_nparts.load();
+    for (int i = 0; i < n && g_tr_n < 4; ++i) {
+        const uintptr_t a = reinterpret_cast<uintptr_t>(g_parts[i].obj + g_parts[i].off);
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) continue;
+        g_tr_lo[g_tr_n] = a; g_tr_hi[g_tr_n] = a + 64; g_tr_page[g_tr_n] = a & ~uintptr_t(0xFFF); g_tr_prot[g_tr_n] = mbi.Protect & ~(PAGE_GUARD);
+        ++g_tr_n;
+    }
+    if (!g_tr_n) return;
+    g_trace_on.store(1);
+    g_tr_start = GetTickCount64();
+    for (int i = 0; i < g_tr_n; ++i) { DWORD old; VirtualProtect(reinterpret_cast<void*>(g_tr_page[i]), 1, g_tr_prot[i] | PAGE_GUARD, &old); }
+    say("trace: watching %d body matrix page(s) for 2 s", g_tr_n);
+}
+
+void trace_poll() {   // from the per-frame step
+    if (!g_trace_on.load()) return;
+    if (GetTickCount64() - g_tr_start < 2000 && g_nth.load() < 380) return;
+    g_trace_on.store(0);
+    Sleep(5);
+    for (int i = 0; i < g_tr_n; ++i) { DWORD old; VirtualProtect(reinterpret_cast<void*>(g_tr_page[i]), 1, g_tr_prot[i], &old); }
+    const int n = g_nth.load() < 400 ? g_nth.load() : 400;
+    say("trace: %d access(es) to the body matrix recorded", n);
+    struct Agg { uint64_t rip, rw; int count; DWORD tid; uint64_t stack[10]; };
+    static Agg agg[40];
+    int na = 0;
+    for (int i = 0; i < n; ++i) {
+        int j = 0;
+        for (; j < na; ++j) if (agg[j].rip == g_th[i].rip && agg[j].rw == g_th[i].rw) break;
+        if (j == na && na < 40) { agg[na] = {g_th[i].rip, g_th[i].rw, 0, g_th[i].tid, {}}; std::memcpy(agg[na].stack, g_th[i].stack, sizeof agg[na].stack); ++na; }
+        if (j < 40) ++agg[j].count;
+    }
+    for (int j = 0; j < na; ++j) {
+        say("trace: %s by game+0x%llX x%d (thread %lu) callers: %llX %llX %llX %llX %llX %llX %llX %llX", agg[j].rw == 1 ? "WRITE" : "read ",
+            static_cast<unsigned long long>(agg[j].rip - reinterpret_cast<uint64_t>(g_game)), agg[j].count, static_cast<unsigned long>(agg[j].tid),
+            static_cast<unsigned long long>(agg[j].stack[0]), static_cast<unsigned long long>(agg[j].stack[1]), static_cast<unsigned long long>(agg[j].stack[2]),
+            static_cast<unsigned long long>(agg[j].stack[3]), static_cast<unsigned long long>(agg[j].stack[4]), static_cast<unsigned long long>(agg[j].stack[5]),
+            static_cast<unsigned long long>(agg[j].stack[6]), static_cast<unsigned long long>(agg[j].stack[7]));
+    }
+}
+
 // ---- visual-only lowering: the car's render parts (body, interior, lights ...) move down, the wheels and the physics stay ----------
 
 // The car's body render matrix: found by the 20:23 probe log. The car's dynamics keep the world position at dyn+0x30; the matrices
@@ -524,6 +618,7 @@ std::atomic<int> g_vis_thread_on{0};
 
 void vis_write_locked(float e);
 void vis_write(float e) {
+    if (g_trace_on.load()) return;   // while the page guard watches the matrix our own accesses would drown the game's
     EnterCriticalSection(&g_vis_cs);
     vis_write_locked(e);
     LeaveCriticalSection(&g_vis_cs);
@@ -588,6 +683,7 @@ DWORD WINAPI vis_writer(LPVOID) {
 }
 
 void visual_step(char* car, float dt, int req, bool usable, bool driving, float speed, uint32_t garage) {
+    trace_poll();
     if (req) {
         if (g_vis_active && (g_vis_target == 1 || g_vis_p > 0)) {
             g_vis_target = 0;
@@ -605,6 +701,7 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
                 g_nparts.store(n);
                 g_parts_ready.store(1);
                 g_vis_pending = true;
+                trace_arm();
             } else {
                 say("airride(visual): found no body matrix: nothing to move");
             }
@@ -889,6 +986,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
 
     if (HANDLE t = CreateThread(nullptr, 0, install_hooks, nullptr, 0, nullptr)) CloseHandle(t);
     InitializeCriticalSection(&g_vis_cs);
+    AddVectoredExceptionHandler(1, trace_veh);
     if (HANDLE t = CreateThread(nullptr, 0, vis_writer, nullptr, 0, nullptr)) CloseHandle(t);
     if (HANDLE t = CreateThread(nullptr, 0, input_thread, nullptr, 0, nullptr)) CloseHandle(t);
     return 0;
