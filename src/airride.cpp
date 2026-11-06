@@ -518,7 +518,18 @@ bool part_alive(const Part& pt) {
 
 float g_vis_camber_deg = 0;
 
+CRITICAL_SECTION g_vis_cs;
+std::atomic<float> g_vis_e{0};
+std::atomic<int> g_vis_thread_on{0};
+
+void vis_write_locked(float e);
 void vis_write(float e) {
+    EnterCriticalSection(&g_vis_cs);
+    vis_write_locked(e);
+    LeaveCriticalSection(&g_vis_cs);
+}
+
+void vis_write_locked(float e) {
     const int n = g_nparts.load();
     for (int i = 0; i < n; ++i) {
         Part& pt = g_parts[i];
@@ -557,12 +568,23 @@ void vis_write(float e) {
 }
 
 void vis_forget() {
+    g_vis_thread_on.store(0);
+    g_vis_e.store(0);
     g_vis_pending = false;
     g_vis_target  = 0;
     g_vis_p       = 0;
     g_vis_active  = false;
     g_parts_ready.store(0);
     g_nparts.store(0);
+}
+
+// The game writes the body matrix again every frame after Car::Update, so a single write per frame is overwritten before it is drawn.
+// This thread re-applies the offset every millisecond or so while the car is lowered (a test of whether this matrix is what is drawn).
+DWORD WINAPI vis_writer(LPVOID) {
+    for (;;) {
+        if (g_vis_thread_on.load()) vis_write(g_vis_e.load());
+        Sleep(g_vis_thread_on.load() ? 0 : 20);
+    }
 }
 
 void visual_step(char* car, float dt, int req, bool usable, bool driving, float speed, uint32_t garage) {
@@ -601,6 +623,7 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
         if (moving > 0) {
             g_vis_active = true;
             g_vis_target = 1;
+            g_vis_thread_on.store(1);
         } else {
             vis_forget();
         }
@@ -613,7 +636,8 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     float np = g_vis_p + (g_vis_target ? 1.0f : -1.0f) * (dt > 0.1f ? 0.1f : dt < 0 ? 0 : dt) / g_duration;
     np       = np < 0 ? 0 : np > 1 ? 1 : np;
     g_vis_p  = np;
-    vis_write(ease(g_vis_p));
+    g_vis_e.store(ease(g_vis_p));
+    vis_write(g_vis_e.load());
     if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
         static int last_state = -1;
         if (last_state != g_vis_target) {
@@ -864,6 +888,8 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     }
 
     if (HANDLE t = CreateThread(nullptr, 0, install_hooks, nullptr, 0, nullptr)) CloseHandle(t);
+    InitializeCriticalSection(&g_vis_cs);
+    if (HANDLE t = CreateThread(nullptr, 0, vis_writer, nullptr, 0, nullptr)) CloseHandle(t);
     if (HANDLE t = CreateThread(nullptr, 0, input_thread, nullptr, 0, nullptr)) CloseHandle(t);
     return 0;
 }
