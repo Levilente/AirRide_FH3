@@ -123,28 +123,34 @@ void load_config() {
 }
 
 // ---- the drop in cm, per garage car (Airride.ini [Drop]) ----------------------------------------------------------------
-int drop_for(uint32_t garage) {
-    wchar_t key[24];
+float drop_for(uint32_t garage) {
+    wchar_t key[24], buf[32];
     _snwprintf(key, 24, L"%u", garage);
-    const int v = static_cast<int>(GetPrivateProfileIntW(L"Drop", key, g_default_drop, g_cfg_path.c_str()));
-    return v < 1 ? 1 : v > 10 ? 10 : v;
+    GetPrivateProfileStringW(L"Drop", key, L"", buf, 32, g_cfg_path.c_str());
+    float v = static_cast<float>(g_default_drop);
+    if (buf[0]) {
+        wchar_t* end = nullptr;
+        const double d = std::wcstod(buf, &end);
+        if (end != buf && std::isfinite(d)) v = static_cast<float>(d);
+    }
+    return v < 1.0f ? 1.0f : v > 10.0f ? 10.0f : v;
 }
-void set_drop(uint32_t garage, int cm) {
-    wchar_t key[24], val[16];
+void set_drop(uint32_t garage, float cm) {
+    wchar_t key[24], val[32];
     _snwprintf(key, 24, L"%u", garage);
-    _snwprintf(val, 16, L"%d", cm);
+    _snwprintf(val, 32, L"%.1f", static_cast<double>(cm));
     WritePrivateProfileStringW(L"Drop", key, val, g_cfg_path.c_str());
 }
 
 // ---- the tuning menu row: Springs > Airride drop (cm) -----------------------------------------------------------------------
 bool car_has_airride() { return g_handle >= 0 && g_api->upgrade_stage(g_mod, g_handle, 0) > 0; }
 
-float row_get(void*) { return static_cast<float>(drop_for(g_api->upgrade_active_garage())); }
+float row_get(void*) { return drop_for(g_api->upgrade_active_garage()); }
 void row_set(void*, float v) {
     const uint32_t garage = g_api->upgrade_active_garage();
-    const int cm          = static_cast<int>(std::lround(v));
+    const float cm        = std::round(v * 10.0f) / 10.0f;
     set_drop(garage, cm);
-    say("tuning: Airride drop for garage car %u set to %d cm", garage, cm);
+    say("tuning: Airride drop for garage car %u set to %.1f cm", garage, static_cast<double>(cm));
 }
 int row_visible(void*) { return car_has_airride() ? 1 : 0; }
 
@@ -725,14 +731,14 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     }
     if (g_vis_pending && g_parts_ready.load()) {
         g_vis_pending = false;
-        const int cm  = drop_for(garage);
+        const float cm = drop_for(garage);
         g_vis_drop_m  = cm * 0.01f;
         g_vis_rewrites = 0;
         g_vis_wheel_rewrites = 0;
         g_vis_camber_deg = g_camber_per_cm * cm;
         int moving = 0;
         for (int i = 0; i < g_nparts.load(); ++i) if (!g_parts[i].wheel) ++moving;
-        say("airride(visual): %d render parts found, %d of them move down, %d wheel parts lean by %.2f deg; lowering %d cm", g_nparts.load(), moving, g_nparts.load() - moving, g_camber_on ? static_cast<double>(g_vis_camber_deg) : 0.0, cm);
+        say("airride(visual): %d render parts found, %d of them move down, %d wheel parts lean by %.2f deg; lowering %.1f cm", g_nparts.load(), moving, g_nparts.load() - moving, g_camber_on ? static_cast<double>(g_vis_camber_deg) : 0.0, static_cast<double>(cm));
         if (moving > 0) {
             g_vis_active = true;
             g_vis_target = 1;
@@ -812,7 +818,7 @@ void step(char* car, float dt) {
         } else if (speed > g_still_mps) {
             say("airride: stick held, but the car isn't standing still (%.2f m/s)", static_cast<double>(speed));
         } else {
-            const int cm = drop_for(garage);
+            const int cm = static_cast<int>(std::lround(drop_for(garage)));
             if (capture_base(spec, cm)) {
                 const float eff = static_cast<float>(cm) < g_room_cm ? static_cast<float>(cm) : g_room_cm;
                 if (eff < static_cast<float>(cm))
@@ -1128,12 +1134,12 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
         row.key     = "Drop";
         row.label   = "Airride|Drop (cm)";
         static char help[200];
-        snprintf(help, sizeof help, "How far the Airride lowers the car, in centimetres (1 to 10). Each centimetre also adds %.2f degrees of negative camber so the wheels fit.", static_cast<double>(g_camber_per_cm));
+        snprintf(help, sizeof help, "How far the Airride lowers the car, in centimetres (1 to 10, in half-centimetre steps). Each centimetre also adds %.2f degrees of negative camber so the wheels fit.", static_cast<double>(g_camber_per_cm));
         row.help    = help;
         row.min     = 1;
         row.max     = 10;
-        row.step    = 1;
-        row.decimals = 0;
+        row.step    = 0.5f;
+        row.decimals = 1;
         row.get     = row_get;
         row.set     = row_set;
         row.visible = row_visible;
