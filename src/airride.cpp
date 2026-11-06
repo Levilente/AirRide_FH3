@@ -937,7 +937,9 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
                 m[13] += lift * g_body_rot[5];
                 m[14] += lift * g_body_rot[9];
                 if (g_camber_on) {
-                    const float side = m[12] > 0 ? 1.0f : -1.0f;
+                    static int plog = 0;
+                    if (plog < 16 && kind == 0) { ++plog; say("airride(visual): wheel %u local pos (%.3f, %.3f, %.3f) rows x(%.2f %.2f %.2f) y(%.2f %.2f %.2f)", wheel, double(m[12]), double(m[13]), double(m[14]), double(m[0]), double(m[1]), double(m[2]), double(m[4]), double(m[5]), double(m[6])); }
+                    const float side = m[14] > 0 ? -1.0f : 1.0f;   // measured in game: the sign of z, not x, tells the side the lean must follow
                     const float th   = side * g_camber_sign * g_vis_camber_deg * e * 0.01745329252f;   // top of the wheel toward the car
                     const float cs = std::cos(th), sn = std::sin(th);
                     for (int r = 0; r < 3; ++r) {   // rotate each basis row about the car's z axis (through the hub)
