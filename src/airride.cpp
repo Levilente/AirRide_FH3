@@ -906,29 +906,70 @@ void menu_diag(const char* what, uintptr_t ret, void* target, const float* m, un
 typedef uint64_t (*BodySetFn)(void*, float*);
 BodySetFn g_orig_body = nullptr;
 thread_local int t_wheel_ctx_player = 0;   // per thread (the game renders cars on several threads at once); the car whose body was just set from game+0x1E32C05 is the player's (its wheels follow in the same function)
+// Garage preview: while the garage's upgrade list has the cursor on the Airride stage, the shop's car (its matrix sits far below the
+// world, y about -1000) is lowered by PreviewCm, smoothly, and put back when the cursor leaves, the stage goes into the basket or the shop closes.
+float g_preview_cm = 3.0f;
+std::atomic<float> g_pv_p{0};
+std::atomic<ULONGLONG> g_pv_last{0};
+float preview_ease() {
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG last = g_pv_last.exchange(now);
+    float p = g_pv_p.load();
+    float dt = last ? static_cast<float>(now - last) * 0.001f : 0.0f;
+    if (dt > 1.0f) { p = 0.0f; dt = 0.0f; }   // the shop wasn't drawn for a while: start from normal height
+    if (dt > 0.1f) dt = 0.1f;
+    const int stage = (g_api && g_api->api_version >= 15 && g_api->upgrade_preview_stage && g_handle >= 0) ? g_api->upgrade_preview_stage(g_mod, g_handle) : -1;
+    p += (stage > 0 ? dt : -dt) / 0.6f;
+    p = p < 0.0f ? 0.0f : p > 1.0f ? 1.0f : p;
+    g_pv_p.store(p);
+    return p * p * (3.0f - 2.0f * p);
+}
+thread_local float t_ctx_drop = 0.0f, t_ctx_camber = 0.0f, t_ctx_rot[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+
 uint64_t detour_body(void* target, float* m) {
     menu_diag("body", reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game), target, m, 99);
-    if (g_vis_car && m) {
+    if (m) {
         __try {
             const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game);
-            char* iface         = *reinterpret_cast<char**>(g_vis_car + kOffIface);
-            if (iface && readable(m, 64)) {
-                const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
-                const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
-                const bool near_player = dx * dx + dz * dz < 0.25f && std::fabs(dy) < 1.5f;   // the player's own body: its matrix sits within a few cm (horizontally) of the dynamics' position; another car beside it is more than a metre off
-                if (ret == 0x1E32C05) t_wheel_ctx_player = near_player ? 1 : 0;
-                const float e = g_vis_e.load();
-                if (g_vis_active && near_player && e > 0.0f) {
-                    static int logged = 0;
-                    if (logged < 6) {
-                        ++logged;
-                        say("airride(visual): body setter near the car: target %p from game+0x%llX, rel (%.2f, %.2f, %.2f)", target, static_cast<unsigned long long>(ret),
-                            static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
+            if (readable(m, 64)) {
+                bool ctx = false;
+                float drop = 0.0f, camber = 0.0f;
+                if (g_vis_car) {
+                    char* iface = *reinterpret_cast<char**>(g_vis_car + kOffIface);
+                    if (iface) {
+                        const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
+                        const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
+                        const bool near_player = dx * dx + dz * dz < 0.25f && std::fabs(dy) < 1.5f;   // the player's own body: its matrix sits within a few cm (horizontally) of the dynamics' position; another car beside it is more than a metre off
+                        const float e = g_vis_e.load();
+                        if (g_vis_active && near_player && e > 0.0f) {
+                            static int logged = 0;
+                            if (logged < 6) {
+                                ++logged;
+                                say("airride(visual): body setter near the car: target %p from game+0x%llX, rel (%.2f, %.2f, %.2f)", target, static_cast<unsigned long long>(ret),
+                                    static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
+                            }
+                            ctx = true;
+                            drop = g_vis_drop_m * e;
+                            camber = g_vis_camber_deg * e;
+                            g_body_hits.fetch_add(1);
+                        }
                     }
-                    if (ret == 0x1E32C05) for (int k = 0; k < 12; ++k) g_body_rot[k] = m[k];   // lateral, up, forward rows of the body (before the offset)
-                    m[13] -= g_vis_drop_m * e;   // everything built from this matrix (body, driver, steering wheel, and the wheels) goes down; the wheels are lifted back in their own setters
-                    g_body_hits.fetch_add(1);
                 }
+                if (!ctx && g_visual && m[13] < -500.0f && m[13] > -5000.0f) {   // the garage's showroom car
+                    const float e = preview_ease();
+                    if (e > 0.0f) {
+                        ctx = true;
+                        drop = g_preview_cm * 0.01f * e;
+                        camber = g_camber_per_cm * g_preview_cm * e;
+                    }
+                }
+                if (ret == 0x1E32C05) {   // the wheels of this car follow in the same function, on this thread
+                    t_wheel_ctx_player = ctx ? 1 : 0;
+                    t_ctx_drop = drop;
+                    t_ctx_camber = camber;
+                    if (ctx) for (int k = 0; k < 12; ++k) { t_ctx_rot[k] = m[k]; g_body_rot[k] = m[k]; }   // lateral, up, forward rows of the body (before the offset)
+                }
+                if (ctx) m[13] -= drop;   // everything built from this matrix (body, driver, steering wheel, and the wheels) goes down; the wheels are lifted back in their own setters
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
@@ -947,26 +988,30 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
     float saved[16];
     bool changed = false;
     const bool flag = t_wheel_ctx_player != 0;
-    if (flag && g_vis_active) add_scene(scene);
-    const bool mine = g_vis_active && (flag || known_scene(scene));
+    if (flag && g_vis_active && t_ctx_drop > 0.0f && g_vis_e.load() > 0.0f) add_scene(scene);
+    const bool scene_mine = g_vis_active && !flag && known_scene(scene);
+    const bool mine = flag || scene_mine;
     if (g_vis_active && g_vis_e.load() > 0.0f && wheel < 8) g_wc[kind][wheel][mine ? 1 : 0].fetch_add(1);
     if (mine && m && wheel < 8) {
         __try {
-            const float e = g_vis_e.load();
-            if (e > 0.0f && readable(m, 64) && std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]) && std::fabs(m[12]) < 20.0f && std::fabs(m[13]) < 20.0f && std::fabs(m[14]) < 20.0f) {
+            const float e = 1.0f;
+            const float drop_now   = flag ? t_ctx_drop : g_vis_drop_m * g_vis_e.load();
+            const float camber_now = flag ? t_ctx_camber : g_vis_camber_deg * g_vis_e.load();
+            const float* rot       = flag ? t_ctx_rot : g_body_rot;
+            if (drop_now > 0.0f && readable(m, 64) && std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]) && std::fabs(m[12]) < 20.0f && std::fabs(m[13]) < 20.0f && std::fabs(m[14]) < 20.0f) {
                 std::memcpy(saved, m, 64);
                 changed = true;
                 // The matrix is the wheel's, in the car's own frame (x lateral, y up, z forward): it moves with the body matrix, which was
                 // lowered by `drop` along the world's up. Undo that in the car's frame: drop times the world-up's components in it.
-                const float lift = g_vis_drop_m * e;
-                m[12] += lift * g_body_rot[1];
-                m[13] += lift * g_body_rot[5];
-                m[14] += lift * g_body_rot[9];
+                const float lift = drop_now;
+                m[12] += lift * rot[1];
+                m[13] += lift * rot[5];
+                m[14] += lift * rot[9];
                 if (g_camber_on) {
                     static int plog = 0;
                     if (plog < 16 && kind == 0) { ++plog; say("airride(visual): wheel %u local pos (%.3f, %.3f, %.3f) rows x(%.2f %.2f %.2f) y(%.2f %.2f %.2f)", wheel, double(m[12]), double(m[13]), double(m[14]), double(m[0]), double(m[1]), double(m[2]), double(m[4]), double(m[5]), double(m[6])); }
                     const float side = m[14] > 0 ? 1.0f : -1.0f;   // the car's frame: x is along the car (front/rear), z across it (the log's wheel positions: x +-1.4, z +-0.9)
-                    const float th   = side * g_camber_sign * g_vis_camber_deg * e * 0.01745329252f;   // top of the wheel toward the car
+                    const float th   = side * g_camber_sign * camber_now * e * 0.01745329252f;   // top of the wheel toward the car
                     const float cs = std::cos(th), sn = std::sin(th);
                     for (int r = 0; r < 3; ++r) {   // rotate each basis row about the car's long (x) axis through the hub: the camber
                         float* v = m + r * 4;
