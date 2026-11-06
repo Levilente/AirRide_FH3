@@ -1126,7 +1126,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
         FH3TuningRow row{};
         row.size    = sizeof row;
         row.key     = "Drop";
-        row.label   = "Airride drop (cm)";
+        row.label   = "Airride|Drop (cm)";
         static char help[200];
         snprintf(help, sizeof help, "How far the Airride lowers the car, in centimetres (1 to 10). Each centimetre also adds %.2f degrees of negative camber so the wheels fit.", static_cast<double>(g_camber_per_cm));
         row.help    = help;
