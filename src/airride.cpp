@@ -60,7 +60,7 @@ char* g_game           = nullptr;
 // fh3-mods\Airride.ini (written with these defaults on first start).
 int g_hold_ms         = 1000;   // how long the left stick is held to lower / raise
 int g_default_drop    = 5;      // cm, for a car whose slider was never touched
-float g_camber_per_cm = 0.3f;   // degrees of negative camber per cm of drop
+float g_camber_per_cm = 0.4f;   // degrees of negative camber per cm of drop
 float g_duration      = 1.4f;   // seconds a lowering or raising takes
 int g_step_ms         = 33;     // the spec is re-applied at most this often while moving
 float g_still_mps     = 0.5f;   // the car counts as standing still below this speed
@@ -616,7 +616,7 @@ float g_vis_camber_deg = 0;
 CRITICAL_SECTION g_vis_cs;
 std::atomic<int> g_cache_calls{0};
 std::atomic<int> g_body_hits{0};
-std::atomic<int> g_wc[2][8][2];   // [tire/wheel setter][wheel index][corrected?] while lowered
+std::atomic<int> g_wc[5][8][2];   // [tire/wheel setter][wheel index][corrected?] while lowered
 float g_body_rot[12], g_body_pos[3];
 void* g_player_scenes[8] = {};
 std::atomic<int> g_player_scene_n{0};
@@ -753,13 +753,13 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
     if ((np == 0 && !g_vis_target) || (np == 1 && g_vis_target)) {
         static int last_state = -1;
         if (last_state != g_vis_target && g_vis_target == 1) {
-            for (int k = 0; k < 2; ++k) {
+            for (int k = 0; k < 5; ++k) {
                 char line[300];
-                int n = snprintf(line, sizeof line, "airride(visual): %s setter calls (idx: corrected/not):", k ? "wheel" : "tire");
+                int n = snprintf(line, sizeof line, "airride(visual): %s setter calls (idx: corrected/not):", k == 0 ? "tire" : k == 1 ? "wheel" : k == 2 ? "part A" : k == 3 ? "part B" : "part C");
                 for (int w = 0; w < 8; ++w) n += snprintf(line + n, sizeof line - n, " %d:%d/%d", w, g_wc[k][w][1].load(), g_wc[k][w][0].load());
                 say("%s", line);
             }
-            for (int k = 0; k < 2; ++k) for (int w = 0; w < 8; ++w) { g_wc[k][w][0].store(0); g_wc[k][w][1].store(0); }
+            for (int k = 0; k < 5; ++k) for (int w = 0; w < 8; ++w) { g_wc[k][w][0].store(0); g_wc[k][w][1].store(0); }
         }
         if (last_state != g_vis_target) {
             say("airride(visual): %s (the game rewrote the body matrix %d times; the cache hook ran %d times, the body setter was changed %d times, the wheel setters %d times)", g_vis_target ? "lowered" : "back at normal height", g_vis_rewrites, g_cache_calls.load(), g_body_hits.load(), g_wheel_hits.load());
@@ -961,6 +961,11 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
 }
 uint64_t detour_tire(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(0, g_orig_tire, scene, wheel, m, ctx, aux); }
 uint64_t detour_wheel(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(1, g_orig_wheel, scene, wheel, m, ctx, aux); }
+// three more per-wheel part setters of the same function (the brake parts): same arguments, same treatment
+PartSetFn g_orig_pa = nullptr, g_orig_pb = nullptr, g_orig_pc = nullptr;
+uint64_t detour_pa(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(2, g_orig_pa, scene, wheel, m, ctx, aux); }
+uint64_t detour_pb(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(3, g_orig_pb, scene, wheel, m, ctx, aux); }
+uint64_t detour_pc(void* scene, unsigned wheel, float* m, void* ctx, void* aux) { return part_detour(4, g_orig_pc, scene, wheel, m, ctx, aux); }
 
 typedef uint64_t (*CarUpdateFn)(void*, float);
 CarUpdateFn g_orig_car_update = nullptr;
@@ -1013,6 +1018,13 @@ DWORD WINAPI install_hooks(LPVOID) {
     if (h5) g_api->enable_hooks(g_mod, h5);
     if (h6) g_api->enable_hooks(g_mod, h6);
     say("hooks: tire setter %s, wheel setter %s", h5 ? "on" : "FAILED", h6 ? "on" : "FAILED");
+    FH3Hook* h7 = g_api->hook_call(g_mod, "part A matrix (Airride)", g_game + 0x1E71B98, reinterpret_cast<void*>(&detour_pa), reinterpret_cast<void**>(&g_orig_pa));
+    FH3Hook* h8 = g_api->hook_call(g_mod, "part B matrix (Airride)", g_game + 0x1E71D04, reinterpret_cast<void*>(&detour_pb), reinterpret_cast<void**>(&g_orig_pb));
+    FH3Hook* h9 = g_api->hook_call(g_mod, "part C matrix (Airride)", g_game + 0x1E71F25, reinterpret_cast<void*>(&detour_pc), reinterpret_cast<void**>(&g_orig_pc));
+    if (h7) g_api->enable_hooks(g_mod, h7);
+    if (h8) g_api->enable_hooks(g_mod, h8);
+    if (h9) g_api->enable_hooks(g_mod, h9);
+    say("hooks: brake parts %s/%s/%s", h7 ? "on" : "FAILED", h8 ? "on" : "FAILED", h9 ? "on" : "FAILED");
     const bool a = h1 && g_api->enable_hooks(g_mod, h1);
     const bool b = h2 && g_api->enable_hooks(g_mod, h2);
     say("hooks: Car update %s, HUD controller %s", a ? "on" : "FAILED", b ? "on" : "FAILED");
