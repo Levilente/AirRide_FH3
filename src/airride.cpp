@@ -70,7 +70,7 @@ float g_below_min_cm  = 1.5f;  // how far under the game's own lowest ride heigh
 bool g_camber_on      = true;
 int g_price           = 3000;
 bool g_verbose        = true;
-bool g_probe          = true;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
+bool g_probe          = false;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
 bool g_visual         = true;   // lower the picture only: the car's render parts move, the physics does not (Visual=0: the physical lowering)
 int g_camber_sign     = 1;      // CamberSign=-1 if the wheels lean the wrong way in the visual mode
 
@@ -110,7 +110,7 @@ void load_config() {
     g_camber_on      = cfg_int(L"Camber", 1) != 0;
     g_price          = cfg_int(L"Price", g_price);
     g_verbose        = cfg_int(L"Log", 1) != 0;
-    g_probe          = cfg_int(L"Probe", 1) != 0;
+    g_probe          = cfg_int(L"Probe", 0) != 0;
     g_visual         = cfg_int(L"Visual", 1) != 0;
     g_camber_sign    = cfg_int(L"CamberSign", 1) < 0 ? -1 : 1;
     if (g_default_drop < 1) g_default_drop = 1;
@@ -339,11 +339,7 @@ void probe_scan(char* car) {
             }
         }
     }
-    if (g_visual) {
-        for (int i = 0; i < np; ++i) g_parts[i] = tmp[i];
-        g_nparts.store(np);
-        g_parts_ready.store(1);
-    }
+    (void)np;
     say("probe: done, %zu objects visited in %llu ms, %zu render objects found", head, static_cast<unsigned long long>(GetTickCount64() - t0), found);
 }
 
@@ -466,6 +462,45 @@ void forget() {
 
 
 // ---- visual-only lowering: the car's render parts (body, interior, lights ...) move down, the wheels and the physics stay ----------
+
+// The car's body render matrix: found by the 20:23 probe log. The car's dynamics keep the world position at dyn+0x30; the matrices
+// sitting 0.35 m below that point (body origin) are reached from the Car by these pointer chains (offsets, then the matrix offset).
+struct AnchorPath { size_t hops[3]; int nhops; size_t mat; };
+const AnchorPath kAnchors[] = {{{0x38, 0x1A0, 0}, 2, 0x20}, {{0x118, 0x78, 0xD0}, 3, 0x220}};
+
+int resolve_anchors(char* car) {
+    int added = 0;
+    __try {
+        char* iface = *reinterpret_cast<char**>(car + kOffIface);
+        if (!iface) return 0;
+        const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
+        if (!std::isfinite(bp[0]) || !std::isfinite(bp[1]) || !std::isfinite(bp[2])) return 0;
+        for (const AnchorPath& a : kAnchors) {
+            char* ptr = car;
+            bool ok   = true;
+            for (int h = 0; h < a.nhops && ok; ++h) {
+                if (!readable(ptr + a.hops[h], 8)) { ok = false; break; }
+                ptr = *reinterpret_cast<char**>(ptr + a.hops[h]);
+                if (reinterpret_cast<uintptr_t>(ptr) < 0x10000) ok = false;
+            }
+            if (!ok || !readable(ptr, a.mat + 64)) { say("airride(visual): anchor via 0x%zX... not readable", a.hops[0]); continue; }
+            const float* m = reinterpret_cast<const float*>(ptr + a.mat);
+            const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
+            if (!looks_matrix(m) || dx * dx + dy * dy + dz * dz > 9.0f) {
+                say("airride(visual): anchor via 0x%zX is not the body matrix any more (rel %.2f %.2f %.2f)", a.hops[0], static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
+                continue;
+            }
+            Part pt{};
+            pt.obj = ptr; pt.off = a.mat; pt.base_y = pt.last_y = m[13]; pt.wheel = false; pt.vt = *reinterpret_cast<const uintptr_t*>(ptr);
+            if (added < 64) g_parts[added++] = pt;
+            say("airride(visual): body matrix at %p +0x%zX, rel (%.2f, %.2f, %.2f)", static_cast<void*>(ptr), a.mat, static_cast<double>(dx), static_cast<double>(dy), static_cast<double>(dz));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        say("airride(visual): a fault while looking for the body matrix");
+    }
+    return added;
+}
+
 char* g_vis_car = nullptr;
 bool g_vis_pending = false;
 int g_vis_target = 0;
@@ -542,10 +577,15 @@ void visual_step(char* car, float dt, int req, bool usable, bool driving, float 
         } else if (speed > g_still_mps) {
             say("airride: stick held, but the car isn't standing still (%.2f m/s)", static_cast<double>(speed));
         } else if (!g_vis_pending) {
-            g_parts_ready.store(0);
-            g_vis_pending = true;
-            probe_start(car);
-            say("airride(visual): looking for the car's render parts");
+            const int n = resolve_anchors(car);
+            if (g_probe) probe_start(car);
+            if (n > 0) {
+                g_nparts.store(n);
+                g_parts_ready.store(1);
+                g_vis_pending = true;
+            } else {
+                say("airride(visual): found no body matrix: nothing to move");
+            }
         }
     }
     if (g_vis_pending && g_parts_ready.load()) {
