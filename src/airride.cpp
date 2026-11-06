@@ -887,9 +887,9 @@ uint64_t detour_cache(void* self) {
 // scene's body node (this+0x10) and tail-jumps on. Three callers, like in FH2. The matrix is a scratch copy on the caller's stack, so
 // it can be changed before the original runs. Only a matrix within 2 m of the player's car (the dynamics' world position) is touched.
 
-// Diagnostics for a menu preview (the garage's upgrade list): while the HUD isn't running, the first calls of each 2 s are logged, 400 at most.
+// Diagnostics for a menu preview (the garage's upgrade list): while F9 is held, the first 24 calls of each 2 s are logged, 400 at most.
 void menu_diag(const char* what, uintptr_t ret, void* target, const float* m, unsigned wheel) {
-    if (!g_menu_diag || GetTickCount64() - g_hud_tick.load() < 1500) return;
+    if (!g_menu_diag || !(GetAsyncKeyState(VK_F9) & 0x8000)) return;   // only while F9 is held (hold it in the garage's upgrade list)
     static std::atomic<ULONGLONG> win{0};
     static std::atomic<int> n{0}, total{0};
     const ULONGLONG now = GetTickCount64();
