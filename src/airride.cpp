@@ -961,7 +961,7 @@ uint64_t detour_body(void* target, float* m) {
     if (m) {
         __try {
             const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game);
-            if (readable(m, 64)) {
+            {
                 bool ctx = false, pv_ctx = false;
                 float drop = 0.0f, camber = 0.0f;
                 if (g_vis_car) {
@@ -1038,7 +1038,7 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
             const float drop_now   = pv_all ? g_preview_cm * 0.01f * pv : flag ? t_ctx_drop : g_vis_drop_m * g_vis_e.load();
             const float camber_now = pv_all ? 0.0f : flag ? t_ctx_camber : g_vis_camber_deg * g_vis_e.load();
             const float* rot       = pv_all ? kUp : flag ? t_ctx_rot : g_body_rot;
-            if (drop_now > 0.0f && readable(m, 64) && std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]) && std::fabs(m[12]) < 20.0f && std::fabs(m[13]) < 20.0f && std::fabs(m[14]) < 20.0f) {
+            if (drop_now > 0.0f && std::isfinite(m[12]) && std::isfinite(m[13]) && std::isfinite(m[14]) && std::fabs(m[12]) < 20.0f && std::fabs(m[13]) < 20.0f && std::fabs(m[14]) < 20.0f) {
                 std::memcpy(saved, m, 64);
                 changed = true;
                 // The matrix is the wheel's, in the car's own frame (x lateral, y up, z forward): it moves with the body matrix, which was
@@ -1127,10 +1127,6 @@ DWORD WINAPI install_hooks(LPVOID) {
                                        reinterpret_cast<void**>(&g_orig_car_update));
     FH3Hook* h2 = g_api->hook_function(g_mod, "HUD controller (Airride: the player's car)", g_game + kRvaHudCtrl, reinterpret_cast<void*>(&detour_hud),
                                        reinterpret_cast<void**>(&g_orig_hud));
-    FH3Hook* h3 = g_api->hook_function(g_mod, "body matrix cache (Airride)", g_game + 0x1B41CC0, reinterpret_cast<void*>(&detour_cache),
-                                       reinterpret_cast<void**>(&g_orig_cache));
-    if (h3) g_api->enable_hooks(g_mod, h3);
-    say("hooks: body matrix cache %s", h3 ? "on" : "FAILED");
     FH3Hook* h4 = g_api->hook_function(g_mod, "body setter (Airride)", g_game + 0x21FF980, reinterpret_cast<void*>(&detour_body),
                                        reinterpret_cast<void**>(&g_orig_body));
     if (h4) g_api->enable_hooks(g_mod, h4);
@@ -1275,7 +1271,6 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
 
     if (HANDLE t = CreateThread(nullptr, 0, install_hooks, nullptr, 0, nullptr)) CloseHandle(t);
     InitializeCriticalSection(&g_vis_cs);
-    AddVectoredExceptionHandler(1, trace_veh);
     if (HANDLE t = CreateThread(nullptr, 0, vis_writer, nullptr, 0, nullptr)) CloseHandle(t);
     if (HANDLE t = CreateThread(nullptr, 0, input_thread, nullptr, 0, nullptr)) CloseHandle(t);
     return 0;
