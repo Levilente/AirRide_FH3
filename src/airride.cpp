@@ -25,6 +25,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
@@ -74,14 +75,26 @@ int g_height_mode     = 0;      // 0 shifts the suspension's ride height range, 
 float g_below_min_cm  = 1.5f;  // how far under the game's own lowest ride height (the tuning slider at 0) the car may be pushed
 bool g_camber_on      = true;
 int g_price           = 3000;
-bool g_verbose        = true;
+bool g_verbose        = false;
 bool g_probe          = false;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
 int g_preview_scope   = 1;      // which bodies the garage preview lowers: 0 all, 1 all above the world's floor (y > -500), 2 only the ones drawn from game+0x1E32C05 (above the floor), 3 only from game+0x21F2556
 bool g_visual         = true;   // lower the picture only: the car's render parts move, the physics does not (Visual=0: the physical lowering)
-bool g_trace          = true;   // log who reads and writes the body matrix for 2 s after a lowering request
+bool g_trace          = false;  // log who reads and writes the body matrix for 2 s after a lowering request
 int g_camber_sign     = 1;      // CamberSign=-1 if the wheels lean the wrong way in the visual mode
 
 std::wstring g_cfg_path;
+
+// Log lines only with Log=1 in Airride.ini (off by default); lines about a problem are always written.
+bool is_problem(const char* s) {
+    char low[256];
+    size_t i = 0;
+    for (; s[i] && i < sizeof low - 1; ++i) low[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(s[i])));
+    low[i] = 0;
+    static const char* const words[] = {"could not", "couldn't", "can't", "cannot", "failed", "not found", "not added", "isn't the code", "not hooked", "needs api", "error"};
+    for (const char* w : words)
+        if (std::strstr(low, w)) return true;
+    return false;
+}
 
 void say(const char* fmt, ...) {
     char line[600];
@@ -89,7 +102,7 @@ void say(const char* fmt, ...) {
     va_start(ap, fmt);
     std::vsnprintf(line, sizeof line, fmt, ap);
     va_end(ap);
-    if (g_api && g_mod) g_api->log(g_mod, line);
+    if (g_api && g_mod && (g_verbose || is_problem(line))) g_api->log(g_mod, line);
 }
 
 // ---- config ---------------------------------------------------------------------------------------------------------
@@ -116,11 +129,11 @@ void load_config() {
     g_below_min_cm   = cfg_float(L"BelowMinCm", g_below_min_cm);
     g_camber_on      = cfg_int(L"Camber", 1) != 0;
     g_price          = cfg_int(L"Price", g_price);
-    g_verbose        = cfg_int(L"Log", 1) != 0;
+    g_verbose        = cfg_int(L"Log", 0) != 0;
     g_probe          = cfg_int(L"Probe", 0) != 0;
     g_visual         = cfg_int(L"Visual", 1) != 0;
     g_preview_scope  = cfg_int(L"PreviewScope", g_preview_scope);
-    g_trace          = cfg_int(L"Trace", 1) != 0;
+    g_trace          = cfg_int(L"Trace", 0) != 0;
     g_camber_sign    = cfg_int(L"CamberSign", 1) < 0 ? -1 : 1;
     if (g_default_drop < 1) g_default_drop = 1;
     if (g_default_drop > 10) g_default_drop = 10;

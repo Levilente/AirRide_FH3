@@ -11,4 +11,4 @@ First release of **Airride for Forza Horizon 3**, on the [FH3 Mod Platform](http
 - The garage's showroom car sits lower while the cursor is on the Airride stage; the back button ends the preview.
 - Only the picture is lowered by default (the car drives as before); `Visual=0` lowers the suspension instead.
 - Only the player's own cars: showcase cars, loaners and AI cars get none.
-- Settings in `fh3-mods\Airride.ini`; update checks through the platform.
+- Settings in `fh3-mods\Airride.ini`; update checks through the platform; a quiet log (only problems) unless `Log=1`.

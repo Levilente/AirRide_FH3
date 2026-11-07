@@ -69,7 +69,7 @@ The mod writes the file with these values on its first start. Restart the game a
 | `Visual` | `1` | `1`: only the picture is lowered. `0`: the suspension is lowered (the car drives lower too). |
 | `HeightMode`, `BelowMinCm` | `0`, `1.5` | With `Visual=0`: `0` shifts the suspension's ride height range, `1` lowers the ride height tuning value; how far below the game's own lowest ride height the car may go. |
 | `CamberSign` | `1` | `-1` if the wheels lean the wrong way in the visual mode. |
-| `Log` | `1` | `0` turns the mod's log lines off. |
+| `Log` | `0` | `1` writes what the mod does to `fh3-mods\platform.log` (for bug reports). Problems are always logged. |
 | `PreviewScope`, `StepMs`, `Probe`, `Trace` | | For bug hunting; leave them as they are. |
 
 The drop of each car is kept under `[Drop]` (garage id = centimetres); the Tuning row writes it.
