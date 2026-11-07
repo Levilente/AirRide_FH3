@@ -64,8 +64,8 @@ bool g_menu_diag = false;
 float g_camber_per_cm = 0.65f;   // degrees of negative camber per cm of drop
 float g_duration      = 1.4f;   // seconds a lowering or raising takes
 int g_step_ms         = 33;     // the spec is re-applied at most this often while moving
-float g_still_mps     = 0.5f;   // the car counts as standing still below this speed
-float g_raise_mps     = 2.0f;   // a lowered car that moves faster than this is raised again
+float g_still_mps     = 5.56f;   // the car counts as standing still below this speed
+float g_raise_mps     = 5.56f;   // a lowered car that moves faster than this is raised again
 int g_height_mode     = 0;      // 0 shifts the suspension's ride height range, 1 lowers the ride-height tuning value
 float g_below_min_cm  = 1.5f;  // how far under the game's own lowest ride height (the tuning slider at 0) the car may be pushed
 bool g_camber_on      = true;
@@ -1206,7 +1206,7 @@ DWORD WINAPI input_thread(LPVOID) {
 int add_upgrade() {
     static const wchar_t* names[kStages] = {L"Stock", L"Airride"};
     static const wchar_t* descs[kStages] = {L"The standard suspension: no air springs.",
-                                            L"Air springs. Hold L3 (press in the left stick) for 1 second while standing still to lower the car smoothly; hold it again, or drive off, to raise it. "
+                                            L"Air springs. Hold L3 (press in the left stick) for 1 second below 20 km/h to lower the car smoothly; hold it again, or go faster than 20 km/h, to raise it. "
                                             L"Set how far it drops (1 to 10 cm) on the car's Tuning, Springs page, in the Airride row."};
     static FH3UpgradeStage stages[kStages];
     for (int i = 0; i < kStages; ++i) stages[i] = {names[i], descs[i], i ? g_price : 0, nullptr, nullptr};
@@ -1214,7 +1214,7 @@ int add_upgrade() {
     d.size           = sizeof d;
     d.id             = "airride.kit";
     d.name           = L"Airride";
-    d.description    = L"Air suspension: lower the car while it stands still, raise it again to drive.";
+    d.description    = L"Air suspension: lower the car below 20 km/h, it rises again above that.";
     d.area           = 2;   // Platform and handling
     d.stage_count    = kStages;
     d.stages         = stages;
@@ -1235,7 +1235,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     info.github_repo      = nullptr;
     info.platform_version = FH3MOD_PLATFORM_VERSION;
     info.check_updates    = 0;
-    info.description      = "Air suspension for every car: lower it while standing still (hold the left stick), set the drop on the Springs tuning page.";
+    info.description      = "Air suspension for every car: lower it below 20 km/h (hold the left stick), set the drop on the Springs tuning page.";
     info.offline_only     = 1;
     g_mod                 = api->register_mod(&info);
     if (!g_mod) return 1;
