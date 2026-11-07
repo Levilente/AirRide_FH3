@@ -1206,8 +1206,8 @@ DWORD WINAPI input_thread(LPVOID) {
 int add_upgrade() {
     static const wchar_t* names[kStages] = {L"Stock", L"Airride"};
     static const wchar_t* descs[kStages] = {L"The standard suspension: no air springs.",
-                                            L"Air springs: hold the left stick while standing still to lower the car, again (or drive off) to raise it. "
-                                            L"The drop is set on the car's tuning, Springs page."};
+                                            L"Air springs. Hold L3 (press in the left stick) for 1 second while standing still to lower the car smoothly; hold it again, or drive off, to raise it. "
+                                            L"Set how far it drops (1 to 10 cm) on the car's Tuning, Springs page, in the Airride row."};
     static FH3UpgradeStage stages[kStages];
     for (int i = 0; i < kStages; ++i) stages[i] = {names[i], descs[i], i ? g_price : 0, nullptr, nullptr};
     FH3UpgradeDef d{};
