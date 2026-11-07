@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Fixed a crash after switching cars: the body setter read the old car, which the game had already removed. It now uses the player car's position copied in that car's own update.
+
 ## 1.0.0
 
 First release of **Airride for Forza Horizon 3**, on the [FH3 Mod Platform](https://github.com/Levilente/FH3_ModPlatform) 1.0.0.

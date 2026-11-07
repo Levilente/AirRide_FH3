@@ -570,6 +570,10 @@ int resolve_anchors(char* car) {
 }
 
 char* g_vis_car = nullptr;
+// Where the player's car is (its dynamics' position), copied in its own Car::Update. The body setter runs for every body
+// the game draws and must not read the Car itself: after a car switch the old Car is gone (a read of it crashed the game).
+float g_vis_pos[3] = {};
+std::atomic<bool> g_vis_pos_ok{false};
 bool g_body_hook_on = false;
 bool g_vis_pending = false;
 int g_vis_target = 0;
@@ -771,6 +775,15 @@ void step(char* car, float dt) {
     const int req = g_request.exchange(0);
     if (g_visual) {
         if (car != g_vis_car) { vis_forget(); g_vis_car = car; }
+        if (char* iface = *reinterpret_cast<char**>(car + kOffIface)) {   // this Car is alive here (its own update)
+            const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
+            g_vis_pos[0] = bp[0];
+            g_vis_pos[1] = bp[1];
+            g_vis_pos[2] = bp[2];
+            g_vis_pos_ok.store(true);
+        } else {
+            g_vis_pos_ok.store(false);
+        }
         visual_step(car, dt, req, usable, driving, speed, garage);
         return;
     }
@@ -913,10 +926,9 @@ uint64_t detour_body(void* target, float* m) {
             {
                 bool ctx = false, pv_ctx = false;
                 float drop = 0.0f, camber = 0.0f;
-                if (g_vis_car) {
-                    char* iface = *reinterpret_cast<char**>(g_vis_car + kOffIface);
-                    if (iface) {
-                        const float* bp = reinterpret_cast<const float*>(iface - kIfaceToDyn + 0x30);
+                if (g_vis_pos_ok.load()) {
+                    {
+                        const float* bp = g_vis_pos;
                         const float dx = m[12] - bp[0], dy = m[13] - bp[1], dz = m[14] - bp[2];
                         const bool near_player = dx * dx + dz * dz < 0.25f && std::fabs(dy) < 1.5f;   // the player's own body: its matrix sits within a few cm (horizontally) of the dynamics' position; another car beside it is more than a metre off
                         const float e = g_vis_e.load();
@@ -1064,6 +1076,7 @@ uint64_t detour_hud(void* c, void* a, void* b, void* d) {
         void* cb  = *reinterpret_cast<void**>(static_cast<char*>(c) + 0x128);
         g_hud_player.store(cb ? obj : nullptr);
         g_hud_tick.store(GetTickCount64());
+        if (g_vis_car && (!cb || obj != g_vis_car)) g_vis_pos_ok.store(false);   // another car (or none): the position is the old car's
     }
     return r;
 }
