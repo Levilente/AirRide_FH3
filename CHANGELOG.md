@@ -1,8 +1,9 @@
 # Changelog
 
-## Unreleased
+## 1.0.1
 
 - Fixed a crash after switching cars: the body setter read the old car, which the game had already removed. It now uses the player car's position copied in that car's own update.
+- Smaller: unused diagnostic code removed.
 
 ## 1.0.0
 

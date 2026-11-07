@@ -8,7 +8,7 @@ car slowly sinks to the ground; hold it again or drive off and it comes back up.
 ![A lowered BMW M4 at a Horizon festival](docs/images/airride-lowered-rear.jpg)
 ![The same car from the front, wheels tucked under the arches](docs/images/airride-lowered-front.jpg)
 
-> Version **1.0.0**. Needs the FH3 Mod Platform **1.0.0** or newer.
+> Version **1.0.1**. Needs the FH3 Mod Platform **1.0.0** or newer.
 
 ## What it does
 
