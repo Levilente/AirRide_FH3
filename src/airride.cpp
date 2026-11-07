@@ -1,9 +1,11 @@
 // Airride for Forza Horizon 3 (FH3 Mod Platform mod).
 //
-// Garage > Upgrades > Platform and Handling > Airride (Stock / Airride). A car with the Airride can be lowered while it
-// stands still: hold the left stick down for a second and the car sinks smoothly (ease in, ease out) by the amount set on
-// the car's Tuning > Springs page ("Airride drop", 1 to 10 cm), with 0.3 degrees of extra negative camber per cm so the
-// wheels fit. Hold the stick again, or drive off, and the car rises back to the height it was lowered from.
+// Garage > Upgrades > Platform and Handling > Airride (Stock / Airride). A car with the Airride can be lowered while it is
+// slower than 20 km/h: hold L3 (press in the left stick) for a second and the car sinks smoothly (ease in, ease out) by the
+// amount set on the car's Tuning > Springs page (the Airride row, "Drop", 1 to 10 cm in 0.1 cm steps), with extra
+// negative camber per cm (CamberPerCm) so the wheels fit. Hold L3 again, or go faster than 20 km/h, and it rises back.
+// By default only the picture moves (Visual=1: the car's render parts are lowered, the physics stays); Visual=0 lowers the
+// physics instead (the notes below). In the garage the showroom car is lowered while the cursor is on the Airride stage.
 //
 // How the car is moved (read from the game's code; the log shows every step):
 //  - Car::Update (game+0x18B8D20, once a frame on the game's thread) is hooked. The HUD controller (game+0xB26690) knows
@@ -1261,9 +1263,9 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     info.size             = sizeof info;
     info.name             = "Airride";
     info.version          = AIRRIDE_VERSION;
-    info.github_repo      = nullptr;
+    info.github_repo      = "Levilente/AirRide_FH3";
     info.platform_version = FH3MOD_PLATFORM_VERSION;
-    info.check_updates    = 0;
+    info.check_updates    = 1;
     info.description      = "Air suspension for every car: lower it below 20 km/h (hold the left stick), set the drop on the Springs tuning page.";
     info.offline_only     = 1;
     g_mod                 = api->register_mod(&info);
