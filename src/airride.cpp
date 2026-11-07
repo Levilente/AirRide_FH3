@@ -496,64 +496,12 @@ struct TraceHit { uint64_t rip, addr, rw, stack[10]; DWORD tid; };
 TraceHit g_th[400];
 std::atomic<int> g_nth{0};
 std::atomic<int> g_trace_on{0};
-std::atomic<int> g_rearm{0};
-uintptr_t g_tr_lo[4], g_tr_hi[4], g_tr_page[4];
+uintptr_t g_tr_page[4];
 DWORD g_tr_prot[4];
 int g_tr_n = 0;
 ULONGLONG g_tr_start = 0;
 
-LONG CALLBACK trace_veh(EXCEPTION_POINTERS* ep) {
-    const DWORD code = ep->ExceptionRecord->ExceptionCode;
-    if (code == STATUS_SINGLE_STEP) {
-        if (g_rearm.exchange(0)) {
-            if (g_trace_on.load()) for (int i = 0; i < g_tr_n; ++i) { DWORD old; VirtualProtect(reinterpret_cast<void*>(g_tr_page[i]), 1, g_tr_prot[i] | PAGE_GUARD, &old); }
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    if (code != STATUS_GUARD_PAGE_VIOLATION || !g_trace_on.load()) return EXCEPTION_CONTINUE_SEARCH;
-    const uintptr_t addr = ep->ExceptionRecord->ExceptionInformation[1];
-    bool ours = false;
-    for (int i = 0; i < g_tr_n; ++i) if ((addr & ~uintptr_t(0xFFF)) == g_tr_page[i]) ours = true;
-    if (!ours) return EXCEPTION_CONTINUE_SEARCH;
-    for (int i = 0; i < g_tr_n; ++i) {
-        if (addr >= g_tr_lo[i] && addr < g_tr_hi[i]) {
-            const int k = g_nth.fetch_add(1);
-            if (k < 400) {
-                TraceHit& h = g_th[k];
-                h.rip = ep->ContextRecord->Rip; h.addr = addr; h.rw = ep->ExceptionRecord->ExceptionInformation[0]; h.tid = GetCurrentThreadId();
-                const uint64_t* sp = reinterpret_cast<const uint64_t*>(ep->ContextRecord->Rsp);
-                int n = 0;
-                const uint64_t lo = reinterpret_cast<uint64_t>(g_game), hi = lo + 0x3000000;
-                for (int j = 0; j < 48 && n < 10; ++j) { if (sp[j] >= lo && sp[j] < hi) h.stack[n++] = sp[j] - lo; }
-                while (n < 10) h.stack[n++] = 0;
-            }
-            break;
-        }
-    }
-    ep->ContextRecord->EFlags |= 0x100;   // single-step, then guard the page again
-    g_rearm.store(1);
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-void trace_arm() {
-    if (!g_trace || g_trace_on.load()) return;
-    g_tr_n = 0;
-    g_nth.store(0);
-    const int n = g_nparts.load();
-    for (int i = 0; i < n && g_tr_n < 4; ++i) {
-        const uintptr_t a = reinterpret_cast<uintptr_t>(g_parts[i].obj + g_parts[i].off);
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (!VirtualQuery(reinterpret_cast<void*>(a), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT) continue;
-        g_tr_lo[g_tr_n] = a; g_tr_hi[g_tr_n] = a + 64; g_tr_page[g_tr_n] = a & ~uintptr_t(0xFFF); g_tr_prot[g_tr_n] = mbi.Protect & ~(PAGE_GUARD);
-        ++g_tr_n;
-    }
-    if (!g_tr_n) return;
-    g_trace_on.store(1);
-    g_tr_start = GetTickCount64();
-    for (int i = 0; i < g_tr_n; ++i) { DWORD old; VirtualProtect(reinterpret_cast<void*>(g_tr_page[i]), 1, g_tr_prot[i] | PAGE_GUARD, &old); }
-    say("trace: watching %d body matrix page(s) for 2 s", g_tr_n);
-}
+// (the page-guard tracer that found who writes the body matrix is no longer armed; trace_poll below ends a trace)
 
 void trace_poll() {   // from the per-frame step
     if (!g_trace_on.load()) return;
@@ -643,7 +591,7 @@ CRITICAL_SECTION g_vis_cs;
 std::atomic<int> g_cache_calls{0};
 std::atomic<int> g_body_hits{0};
 std::atomic<int> g_wc[5][8][2];   // [tire/wheel setter][wheel index][corrected?] while lowered
-float g_body_rot[12], g_body_pos[3];
+float g_body_rot[12];
 void* g_player_scenes[8] = {};
 std::atomic<int> g_player_scene_n{0};
 bool known_scene(void* sc) { const int n = g_player_scene_n.load(); for (int i = 0; i < n && i < 8; ++i) if (g_player_scenes[i] == sc) return true; return false; }
@@ -884,22 +832,6 @@ void step(char* car, float dt) {
 
 // game+0x1B41CC0 refreshes a body object's cached matrix (this+0x20, 64 bytes, copied from its source when stale) and its caller
 // reads the cache right away (found with the page-guard trace). Changing the cache after the original runs is seen by that reader.
-typedef uint64_t (*CacheFn)(void*);
-CacheFn g_orig_cache = nullptr;
-uint64_t detour_cache(void* self) {
-    const uint64_t r = g_orig_cache(self);
-    if (g_vis_active && !g_trace_on.load()) {
-        const int n = g_nparts.load();
-        for (int i = 0; i < n; ++i) {
-            if (g_parts[i].obj != static_cast<char*>(self)) continue;
-            EnterCriticalSection(&g_vis_cs);
-            vis_write_part(g_parts[i], g_vis_e.load());
-            LeaveCriticalSection(&g_vis_cs);
-            g_cache_calls.fetch_add(1);
-        }
-    }
-    return r;
-}
 
 
 // game+0x21FF980 is the FH3 twin of the FH2 body setter the StanceAirride mod intercepts: it copies the body's 4x4 matrix into the
@@ -1050,7 +982,6 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
     if (g_vis_active && g_vis_e.load() > 0.0f && wheel < 8) g_wc[kind][wheel][mine ? 1 : 0].fetch_add(1);
     if (mine && m && wheel < 8) {
         __try {
-            const float e = 1.0f;
             static const float kUp[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
             const float drop_now   = pv_all ? g_preview_cm * 0.01f * pv : flag ? t_ctx_drop : g_vis_drop_m * g_vis_e.load();
             const float camber_now = pv_all ? 0.0f : flag ? t_ctx_camber : g_vis_camber_deg * g_vis_e.load();
