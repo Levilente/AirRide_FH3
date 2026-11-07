@@ -17,6 +17,8 @@
 //  - Lowering: every few frames this mod writes new values into the spec and calls slot 80. Height mode 0 shifts MinRideHeight
 //    and MaxRideHeight of both axles down by the eased drop, mode 1 lowers the normalised ride-height tuning value instead.
 #include "fh3mod.h"
+#include "icon_data.h"   // icons/airride.png as FH3 .swatchbin (scripts/gen_icons.py)
+#include "icon_pack.h"
 
 #include <windows.h>
 
@@ -1203,18 +1205,45 @@ DWORD WINAPI input_thread(LPVOID) {
     }
 }
 
+// icons/airride.png is handed to the game as Upgrade_Parts\Custom\airride_airride_Icon.swatchbin (platform set_file); no game file changes.
+const char kIconDir[]   = "GAME:\\Media\\UI\\Textures\\Data_Bound\\Upgrade_Parts\\";
+const char kLargeIcon[] = "GAME:\\Media\\UI\\Textures\\Data_Bound\\Upgrade_Parts\\Platform_Handling\\springs_dampers_LG_Icon.swatchbin";
+std::string g_icon_path;
+
+void install_icons() {
+    if (g_api->api_version < 2 || !g_api->set_file) return;
+    static const char base[] = "ui/textures/data_bound/Upgrade_Parts/";
+    int ok = 0, total = 0;
+    for (const IconEntry* e = k_icons; e->slot; e++) {
+        char path[200];
+        int n = 0;
+        for (int i = 0; base[i]; i++) path[n++] = base[i];
+        icon_name(e, path + n, '/');
+        const unsigned size = icon_unpack(e, g_icon_buf);
+        ++total;
+        if (g_api->set_file(g_mod, path, g_icon_buf, size)) ++ok;
+    }
+    say("icons handed to the game: %d/%d", ok, total);
+    IconEntry e{"airride", 0, nullptr, 0};
+    char nm[160];
+    icon_name(&e, nm, '\\');
+    g_icon_path = std::string(kIconDir) + nm;
+}
+
 int add_upgrade() {
     static const wchar_t* names[kStages] = {L"Stock", L"Airride"};
     static const wchar_t* descs[kStages] = {L"The standard suspension: no air springs.",
                                             L"Air springs. Hold L3 (press in the left stick) for 1 second below 20 km/h to lower the car smoothly; hold it again, or go faster than 20 km/h, to raise it. "
                                             L"Set how far it drops (1 to 10 cm) on the car's Tuning, Springs page, in the Airride row."};
     static FH3UpgradeStage stages[kStages];
-    for (int i = 0; i < kStages; ++i) stages[i] = {names[i], descs[i], i ? g_price : 0, nullptr, nullptr};
+    for (int i = 0; i < kStages; ++i) stages[i] = {names[i], descs[i], i ? g_price : 0, i && !g_icon_path.empty() ? g_icon_path.c_str() : nullptr, i && !g_icon_path.empty() ? kLargeIcon : nullptr};
     FH3UpgradeDef d{};
     d.size           = sizeof d;
     d.id             = "airride.kit";
     d.name           = L"Airride";
     d.description    = L"Air suspension: lower the car below 20 km/h, it rises again above that.";
+    d.icon           = g_icon_path.empty() ? nullptr : g_icon_path.c_str();
+    d.icon_large     = g_icon_path.empty() ? nullptr : kLargeIcon;
     d.area           = 2;   // Platform and handling
     d.stage_count    = kStages;
     d.stages         = stages;
@@ -1243,6 +1272,7 @@ FH3MOD_EXPORT int fh3mod_init(const FH3ModApi* api) {
     g_cfg_path = std::wstring(api->azimuth_dir) + L"\\fh3-mods\\Airride.ini";
     load_config();
 
+    install_icons();
     g_handle = add_upgrade();
     say("registered: upgrade handle %d (price %d, hold %d ms, height mode %d, camber %.2f deg/cm)", g_handle, g_price, g_hold_ms, g_height_mode,
         static_cast<double>(g_camber_per_cm));
