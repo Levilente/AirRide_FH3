@@ -72,6 +72,7 @@ bool g_camber_on      = true;
 int g_price           = 3000;
 bool g_verbose        = true;
 bool g_probe          = false;   // log the render objects found from the Car on every button hold (for the visual-only lowering)
+int g_preview_scope   = 1;      // which bodies the garage preview lowers: 0 all, 1 all above the world's floor (y > -500), 2 only the ones drawn from game+0x1E32C05 (above the floor), 3 only from game+0x21F2556
 bool g_visual         = true;   // lower the picture only: the car's render parts move, the physics does not (Visual=0: the physical lowering)
 bool g_trace          = true;   // log who reads and writes the body matrix for 2 s after a lowering request
 int g_camber_sign     = 1;      // CamberSign=-1 if the wheels lean the wrong way in the visual mode
@@ -114,6 +115,7 @@ void load_config() {
     g_verbose        = cfg_int(L"Log", 1) != 0;
     g_probe          = cfg_int(L"Probe", 0) != 0;
     g_visual         = cfg_int(L"Visual", 1) != 0;
+    g_preview_scope  = cfg_int(L"PreviewScope", g_preview_scope);
     g_trace          = cfg_int(L"Trace", 1) != 0;
     g_camber_sign    = cfg_int(L"CamberSign", 1) < 0 ? -1 : 1;
     if (g_default_drop < 1) g_default_drop = 1;
@@ -908,6 +910,12 @@ BodySetFn g_orig_body = nullptr;
 thread_local int t_wheel_ctx_player = 0;   // per thread (the game renders cars on several threads at once); the car whose body was just set from game+0x1E32C05 is the player's (its wheels follow in the same function)
 // Garage preview: while the garage's upgrade list has the cursor on the Airride stage, the shop's car is lowered by PreviewCm, smoothly, and put back when the cursor leaves, the stage goes into the basket or the shop closes.
 float g_preview_cm = 3.0f;
+std::atomic<ULONGLONG> g_back_tick{0};   // the back button (B / Esc) went down
+std::atomic<ULONGLONG> g_back_seen{0};
+std::atomic<uint32_t> g_cancel_serial{0};
+std::atomic<bool> g_cancelled{false};
+std::atomic<long long> g_pv_ticks{0}, g_pv_calls{0};   // the time our detours cost while a preview shows
+std::atomic<ULONGLONG> g_pv_logged{0};
 std::atomic<float> g_pv_p{0}, g_pv_e{0};   // the preview's progress, and its eased value for the wheel setters
 std::atomic<ULONGLONG> g_pv_last{0};
 float preview_ease() {
@@ -918,7 +926,15 @@ float preview_ease() {
     if (dt > 1.0f) { p = 0.0f; dt = 0.0f; }   // the shop wasn't drawn for a while: start from normal height
     const float raw_dt = dt;
     if (dt > 0.1f) dt = 0.1f;
-    const int stage = (g_api && g_api->api_version >= 15 && g_api->upgrade_preview_stage && g_handle >= 0) ? g_api->upgrade_preview_stage(g_mod, g_handle) : -1;
+    int stage = (g_api && g_api->api_version >= 15 && g_api->upgrade_preview_stage && g_handle >= 0) ? g_api->upgrade_preview_stage(g_mod, g_handle) : -1;
+    // The game gives no sign when the player backs out of the list: the back button ends the preview here, until the list shows something again.
+    const uint32_t serial = (g_api && g_api->api_version >= 15 && g_api->upgrade_shop_serial) ? g_api->upgrade_shop_serial() : 0;
+    const ULONGLONG bt = g_back_tick.load();
+    if (bt != g_back_seen.exchange(bt) && stage >= 0) { g_cancel_serial.store(serial); g_cancelled.store(true); }
+    if (g_cancelled.load()) {
+        if (serial == g_cancel_serial.load()) stage = -1;
+        else g_cancelled.store(false);
+    }
     static std::atomic<int> last_stage{-2}, shown{0};
     if (last_stage.exchange(stage) != stage && shown.fetch_add(1) < 60) say("garage preview: the list shows stage %d (ease %.2f)", stage, static_cast<double>(p));
     if (stage <= 0 && raw_dt > 0.25f) p = 0.0f;   // the setters come rarely in the garage: after a pause, going back is immediate
@@ -927,12 +943,20 @@ float preview_ease() {
     g_pv_p.store(p);
     const float ev = p * p * (3.0f - 2.0f * p);
     g_pv_e.store(ev);
+    if (ev > 0.0f && now - g_pv_logged.load() >= 1000) {
+        g_pv_logged.store(now);
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        say("garage preview cost: %lld calls, %.2f ms spent in the last second", g_pv_calls.exchange(0), static_cast<double>(g_pv_ticks.exchange(0)) * 1000.0 / static_cast<double>(f.QuadPart));
+    }
     return ev;
 }
 thread_local bool t_ctx_preview = false;
 thread_local float t_ctx_drop = 0.0f, t_ctx_camber = 0.0f, t_ctx_rot[12] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
 
 uint64_t detour_body(void* target, float* m) {
+    LARGE_INTEGER t0{};
+    const bool timing = g_pv_e.load() > 0.0f;
+    if (timing) QueryPerformanceCounter(&t0);
     menu_diag("body", reinterpret_cast<uintptr_t>(__builtin_return_address(0)) - reinterpret_cast<uintptr_t>(g_game), target, m, 99);
     if (m) {
         __try {
@@ -961,7 +985,8 @@ uint64_t detour_body(void* target, float* m) {
                         }
                     }
                 }
-                if (!ctx && g_visual) {   // the garage's showroom car (its position isn't known: while the upgrade list has the cursor on the Airride, every car drawn is lowered, only the shop's is on screen)
+                const bool in_scope = g_preview_scope == 0 || (m[13] > -500.0f && (g_preview_scope == 1 || (g_preview_scope == 2 && ret == 0x1E32C05) || (g_preview_scope == 3 && ret == 0x21F2556)));
+                if (!ctx && g_visual && in_scope) {   // the garage's showroom car (its position isn't known: while the upgrade list has the cursor on the Airride, every car drawn is lowered, only the shop's is on screen)
                     const float e = preview_ease();
                     if (e > 0.0f) {
                         ctx = true;
@@ -982,6 +1007,7 @@ uint64_t detour_body(void* target, float* m) {
         } __except (EXCEPTION_EXECUTE_HANDLER) {
         }
     }
+    if (timing) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); g_pv_ticks.fetch_add(t1.QuadPart - t0.QuadPart); g_pv_calls.fetch_add(1); }
     return g_orig_body(target, m);
 }
 
@@ -993,13 +1019,16 @@ PartSetFn g_orig_tire = nullptr, g_orig_wheel = nullptr;
 
 uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, float* m, void* ctx, void* aux) {
     menu_diag(kind == 0 ? "tire" : kind == 1 ? "wheel" : "brake part", 0, scene, m, wheel);
+    LARGE_INTEGER t0{};
+    const bool timing = g_pv_e.load() > 0.0f;
+    if (timing) QueryPerformanceCounter(&t0);
     float saved[16];
     bool changed = false;
     const bool flag = t_wheel_ctx_player != 0;
     if (flag && g_vis_active && t_ctx_drop > 0.0f && g_vis_e.load() > 0.0f) add_scene(scene);
     const bool scene_mine = g_vis_active && !flag && known_scene(scene);
     const float pv = g_pv_e.load();
-    const bool pv_all = pv > 0.0f && !flag && !scene_mine;   // the garage preview: every wheel part drawn is lifted back by the drop (all bodies were lowered)
+    const bool pv_all = pv > 0.0f && !flag && !scene_mine && g_preview_scope != 2;   // the garage preview: every wheel part drawn is lifted back by the drop (all bodies were lowered)
     const bool mine = flag || scene_mine || pv_all;
     if (g_vis_active && g_vis_e.load() > 0.0f && wheel < 8) g_wc[kind][wheel][mine ? 1 : 0].fetch_add(1);
     if (mine && m && wheel < 8) {
@@ -1048,6 +1077,7 @@ uint64_t part_detour(int kind, PartSetFn orig, void* scene, unsigned wheel, floa
             changed = false;
         }
     }
+    if (timing) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1); g_pv_ticks.fetch_add(t1.QuadPart - t0.QuadPart); g_pv_calls.fetch_add(1); }
     const uint64_t r = orig(scene, wheel, m, ctx, aux);
     if (changed) std::memcpy(m, saved, 64);
     return r;
@@ -1151,15 +1181,22 @@ DWORD WINAPI input_thread(LPVOID) {
     if (!get) { say("XInput couldn't be loaded: the left stick can't lower the car"); return 0; }
     ULONGLONG held_since = 0;
     bool fired           = false;
+    bool back_was        = false;
     for (;;) {
         Sleep(16);
-        bool down = false;
+        bool down = false, back = false;
         if (game_in_front()) {
-            for (DWORD i = 0; i < 4 && !down; ++i) {
+            for (DWORD i = 0; i < 4; ++i) {
                 PadState st{};
-                if (get(i, &st) == ERROR_SUCCESS && (st.buttons & 0x0040)) down = true;   // XINPUT_GAMEPAD_LEFT_THUMB
+                if (get(i, &st) == ERROR_SUCCESS) {
+                    if (st.buttons & 0x0040) down = true;   // XINPUT_GAMEPAD_LEFT_THUMB
+                    if (st.buttons & 0x2000) back = true;   // XINPUT_GAMEPAD_B
+                }
             }
+            if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) back = true;
         }
+        if (back && !back_was) g_back_tick.store(GetTickCount64());
+        back_was = back;
         if (!down) { held_since = 0; fired = false; continue; }
         const ULONGLONG now = GetTickCount64();
         if (!held_since) held_since = now;
